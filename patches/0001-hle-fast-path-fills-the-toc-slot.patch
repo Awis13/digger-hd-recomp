@@ -1,0 +1,21 @@
+diff --git a/runtime/ppu/ppu_hle.cpp b/runtime/ppu/ppu_hle.cpp
+index 15d4ef60..89d079d4 100644
+--- a/runtime/ppu/ppu_hle.cpp
++++ b/runtime/ppu/ppu_hle.cpp
+@@ -254,8 +254,15 @@ static void hle_top_note(uint32_t nid, const char* name, const ppu_context* ctx,
+ extern "C" uint32_t ppu_prof_resolve_host(void* ra);
+ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
+ {
+-    if (const hle_fast_fn f = hle_fast(nid))
++    if (const hle_fast_fn f = hle_fast(nid)) {
++        /* A fast handler leaves the live r2 alone, but the caller restores
++         * its TOC from 0x28(r1) after the call, and that slot was the import
++         * stub's to fill. The guard below fills it on the slow path; a fast
++         * return skips the guard, so fill it here or the caller reloads
++         * whatever the slot held (0 on a fresh frame). */
++        vm_write64(ctx->gpr[1] + 0x28, ctx->gpr[2]);
+         if (f(ctx)) return;
++    }
+ 
+     /* HLE_BT_EVERY=<n>: dump the calling thread's guest stack every nth HLE
+      * call it makes. WAITBT_EVERY only samples threads that are blocking on an

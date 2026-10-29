@@ -1,0 +1,26 @@
+diff --git a/runtime/ppu/ppu_loader.cpp b/runtime/ppu/ppu_loader.cpp
+index 9309f2d3..a0182b9f 100644
+--- a/runtime/ppu/ppu_loader.cpp
++++ b/runtime/ppu/ppu_loader.cpp
+@@ -20,6 +20,9 @@
+ 
+ /* Hoisted: code below was added above the original include block, so these
+  * have to be visible from here rather than 160 lines further down. */
++#if defined(__APPLE__)
++#include <TargetConditionals.h>
++#endif
+ #include <stdint.h>
+ #include <stdio.h>
+ #include <stdlib.h>
+@@ -203,7 +206,11 @@ extern "C" void ps3_install_guest_ptr_trap(void)
+     /* Leave the chunk holding the program break alone. Reserving the space just
+      * above it would stop brk from ever growing and silently push every small
+      * allocation onto mmap -- a steep price for a diagnostic. */
++#if defined(__APPLE__) && TARGET_OS_TV
++    uintptr_t brk_now = 0;          /* tvOS has no sbrk, and no heap behind it */
++#else
+     uintptr_t brk_now = (uintptr_t)sbrk(0);
++#endif
+ 
+     size_t got = 0;
+     for (uintptr_t a = 0x10000u; a < 0x100000000ull; a += 0x10000000ull) {

@@ -1,0 +1,61 @@
+diff --git a/runtime/spu/spu_channels.c b/runtime/spu/spu_channels.c
+index 5fc50208..ff869280 100644
+--- a/runtime/spu/spu_channels.c
++++ b/runtime/spu/spu_channels.c
+@@ -1942,6 +1942,23 @@ int spu_overlay_register_verified_region(uint32_t content_ea, uint32_t load_lsa,
+     return 1;
+ }
+ 
++/* The same verified overlay, recognised by the first 16 bytes of the GET that
++ * lands at load_lsa instead of by its source EA: for code a title copies to a
++ * buffer of its own at run time (MultiStream reads the firmware MP3 decoder
++ * from /dev_flash into memory it allocates, so no EA is fixed). The code bytes
++ * are still compared before the first dispatch, so a signature collision
++ * leaves the span interpreted rather than running the wrong lift. */
++int spu_overlay_register_verified_sig(const uint8_t sig[16], uint32_t load_lsa,
++    uint32_t span, int image_id, const spu_overlay_code_segment* code, unsigned count)
++{
++    if (!sig || !spu_overlay_register_verified_region(0, load_lsa, span, image_id, code, count))
++        return 0;
++    spu_ovl_src* o = &s_ovl_src[s_ovl_src_count - 1];
++    memcpy(o->sig, sig, 16);
++    o->has_sig = 1;
++    return 1;
++}
++
+ static int spu_overlay_resident_verified(spu_context* ctx, unsigned slot)
+ {
+     int* state = &ctx->resident_code[slot].verify_state;
+@@ -2871,6 +2888,14 @@ void spu_indirect_branch(spu_context* ctx)
+               if (PS3_LOG_FIRST(_n, 8))
+                   fprintf(stderr, "[spu] img=%d interpreting unlifted LS 0x%05X "
+                           "(runtime-loaded code)\n", ctx->image_id, p);
++              /* SPU_DUMP_LS_UNLIFTED=<file>: the whole local store, once, at
++               * the first such entry -- to find the runtime-loaded module in it
++               * and lift it at the address it runs from. */
++              { static int dumped = 0; const char* f = getenv("SPU_DUMP_LS_UNLIFTED");
++                if (f && *f && !dumped) { dumped = 1;
++                    FILE* o = fopen(f, "wb");
++                    if (o) { fwrite(ctx->ls, 1, SPU_LS_SIZE, o); fclose(o);
++                             fprintf(stderr, "[spu] local store dumped to %s at entry 0x%05X\n", f, p); } } }
+               spu_interp_run(ctx, p);
+               return;
+           } }
+diff --git a/runtime/spu/spu_overlay_residency.h b/runtime/spu/spu_overlay_residency.h
+index 08af5b11..308112af 100644
+--- a/runtime/spu/spu_overlay_residency.h
++++ b/runtime/spu/spu_overlay_residency.h
+@@ -29,6 +29,13 @@ int spu_overlay_register_verified_region(uint32_t content_ea, uint32_t load_lsa,
+     uint32_t span, int image_id, const spu_overlay_code_segment* code,
+     unsigned count);
+ 
++/* As above, but recognised by the first 16 bytes of the GET that lands at
++ * load_lsa rather than by its source EA, for code copied to a buffer allocated
++ * at run time. The code bytes are compared before the first dispatch as well. */
++int spu_overlay_register_verified_sig(const uint8_t sig[16], uint32_t load_lsa,
++    uint32_t span, int image_id, const spu_overlay_code_segment* code,
++    unsigned count);
++
+ #ifdef __cplusplus
+ }
+ #endif

@@ -1,0 +1,20 @@
+name: DiggerHDBuilder
+options:
+  deploymentTarget: {macOS: "14.0"}
+targets:
+  DiggerHDBuilder:
+    type: application
+    platform: macOS
+    sources: [Sources]
+    settings:
+      PRODUCT_NAME: Digger HD Builder
+      PRODUCT_BUNDLE_IDENTIFIER: eu.postnikov.diggerhd.builder
+      CODE_SIGN_IDENTITY: "-"
+      ENABLE_APP_SANDBOX: NO
+      ENABLE_HARDENED_RUNTIME: NO
+      GENERATE_INFOPLIST_FILE: YES
+      INFOPLIST_KEY_CFBundleDisplayName: Digger HD Builder
+      INFOPLIST_KEY_LSApplicationCategoryType: public.app-category.developer-tools
+      SWIFT_VERSION: "5.0"
+      MARKETING_VERSION: "0.1"
+      CURRENT_PROJECT_VERSION: "1"

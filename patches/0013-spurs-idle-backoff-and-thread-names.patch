@@ -1,0 +1,82 @@
+diff --git a/runtime/platform/win32_compat.c b/runtime/platform/win32_compat.c
+index 36989e3a..c7736d59 100644
+--- a/runtime/platform/win32_compat.c
++++ b/runtime/platform/win32_compat.c
+@@ -34,6 +34,9 @@
+ #  define _GNU_SOURCE          /* pthread_setaffinity_np, CPU_SET, REG_RIP */
+ #endif
+ 
++#if defined(__APPLE__)
++#include <dlfcn.h>
++#endif
+ #include "win32_compat.h"
+ 
+ #include <errno.h>
+@@ -512,6 +515,14 @@ static void* thread_trampoline(void* p)
+ 
+     if (prio != THREAD_PRIORITY_NORMAL) apply_priority(pthread_self(), t->tid, prio, 1);
+     if (aff) apply_affinity(pthread_self(), aff);
++#if defined(__APPLE__)
++    /* Name the thread after its entry function until something names it
++     * better, so per-thread tools (sample, Instruments, the iOS CPU log)
++     * say what each one is. */
++    { Dl_info di;
++      const void* entry = t->fn ? (const void*)t->fn : (const void*)t->fn_crt;
++      if (dladdr(entry, &di) && di.dli_sname) pthread_setname_np(di.dli_sname); }
++#endif
+ 
+     DWORD rc = t->fn ? t->fn(t->arg) : (DWORD)t->fn_crt(t->arg);
+     t_current_thread = NULL;
+diff --git a/runtime/spu/spu_channels.c b/runtime/spu/spu_channels.c
+index ff869280..836e0d6d 100644
+--- a/runtime/spu/spu_channels.c
++++ b/runtime/spu/spu_channels.c
+@@ -576,6 +576,11 @@ volatile unsigned g_spu_putllc_sync_hit = 0;
+  * completion. Chosen above the context/descriptor we park near the top of LS. */
+ #define SPU_JOB_RETURN_LS   0x3FF00u
+ 
++/* Ordinary (non-atomic) DMA commands this host thread has issued. A SPURS
++ * policy module that polls cellSpursModulePoll without fetching anything in
++ * between is idle; see the back-off at SPURS_PM_SELECT_WORKLOAD_LS. */
++static SPU_THREAD_LOCAL uint64_t t_spu_dma_cmds;
++
+ /* Returns 1 if `cmd` is an atomic line op and was handled here, else 0. */
+ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
+ {
+@@ -585,8 +590,10 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
+      * as an atomic spin, which is a genuinely misleading place to start
+      * debugging from. Non-atomic commands belong to the DMA engine. */
+     if (cmd != MFC_GETLLAR_CMD && cmd != MFC_PUTLLC_CMD &&
+-        cmd != MFC_PUTLLUC_CMD && cmd != MFC_PUTQLLUC_CMD)
++        cmd != MFC_PUTLLUC_CMD && cmd != MFC_PUTQLLUC_CMD) {
++        t_spu_dma_cmds++;
+         return 0;
++    }
+ 
+     uint32_t ea  = ctx->mfc_eal & ~(uint32_t)(MFC_ATOMIC_LINE - 1);
+     uint32_t lsa = ctx->mfc_lsa & SPU_LS_MASK;
+@@ -2670,6 +2677,24 @@ void spu_indirect_branch(spu_context* ctx)
+               if (s_t && (n <= 4 || (n % 4096) == 0) && s_poll_logs++ < 64)
+                   fprintf(stderr, "[spurs-pm] poll #%u (r3=0x%08X) -> continue\n",
+                           n, ctx->gpr[3]._u32[0]); }
++            /* An idle policy module (a job manager with an empty queue)
++             * calls back here in a tight loop, reading only its queue's lock
++             * line in between. On the PS3 that spins an SPU of its own; here
++             * it would hold a host core at 100% -- a third of the fast cores
++             * of an A15 -- and the GPU's power budget with it. After 32
++             * polls in a row with no data DMA, sleep a little, growing to
++             * 250 us: far below a frame, and a fetch resets it. */
++            { static SPU_THREAD_LOCAL uint64_t t_last_dma; static SPU_THREAD_LOCAL unsigned t_idle;
++              if (t_spu_dma_cmds != t_last_dma) { t_last_dma = t_spu_dma_cmds; t_idle = 0; }
++              else if (++t_idle > 32) {
++                  const unsigned us = t_idle > 256 ? 250u : 20u + (t_idle - 32);
++#ifdef _WIN32
++                  (void)us; Sleep(0);
++#else
++                  struct timespec ts = { 0, (long)us * 1000L };
++                  nanosleep(&ts, NULL);
++#endif
++              } }
+             ctx->gpr[3] = spu_make_preferred_u32(0);
+             ctx->pc = ctx->gpr[0]._u32[0] & SPU_LS_MASK;
+             return;

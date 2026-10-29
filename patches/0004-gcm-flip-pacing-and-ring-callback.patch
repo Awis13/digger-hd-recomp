@@ -1,0 +1,360 @@
+diff --git a/libs/video/cellGcmSys.c b/libs/video/cellGcmSys.c
+index 298ee7de..c227379c 100644
+--- a/libs/video/cellGcmSys.c
++++ b/libs/video/cellGcmSys.c
+@@ -987,7 +987,25 @@ static volatile u32 s_fifo_back_jumps = 0;
+  * for the walker. Its context still reads current == end then, which is exactly
+  * what the drain's own overrun recycle looks for; firing that under the
+  * callback teleports get to begin and drops the tail the callback is waiting on. */
++/* Why the last drain pass ended ("caught-up", "parked", "flip", ...), for the
++ * GCM_RECDBG report of a recycle that waits on the walker. */
++static const char* volatile s_last_drain_why = "";
+ static volatile int s_fifo_recycle_waiting = 0;
++/* The title's ring end while cellGcm_fifo_recycle manages its ring (0 before);
++ * ctx->end is then the callback's limit, which can sit below it. */
++static u32 s_ring_end_ea;
++/* The JUMPs to begin that cellGcm_fifo_recycle wrote and the walker has not
++ * yet taken, oldest first: the callback appends one per wrap, the walker drops
++ * the oldest when it executes it. Their number is how many laps the walker is
++ * behind the title. Single producer (the title's thread, in the callback),
++ * single consumer (the drain). */
++#define GCM_RING_LAPS 16u
++static u32 s_ring_jumps[GCM_RING_LAPS];
++static volatile unsigned s_ring_jumps_head, s_ring_jumps_tail;
++static unsigned gcm_ring_laps_behind(void)
++{
++    return s_ring_jumps_tail - s_ring_jumps_head;
++}
+ 
+ /* Bytes the walker is behind the writer. Linear while put >= get. Once the
+  * title's ring wraps, put sits BEHIND get and the backlog is the rest of the
+@@ -1592,8 +1610,36 @@ static u32 gcm_spu_block_for_put(u32 put)
+  *
+  * Dropping DRAWS on a resync is survivable: a frame is lost. Dropping a FENCE
+  * is not, it deadlocks the title. Sweep the skipped range first. */
++/* GCM_RECDBG: the last SPU stores over a self-JUMP park (spu_dma.h). */
++static struct { u32 ea, word; unsigned long long ms; } s_unparks[256];
++static volatile unsigned s_unpark_n;
++static int gcm_recdbg_on(void)
++{
++    static int on = -1;
++    if (on < 0) on = getenv("GCM_RECDBG") ? 1 : 0;
++    return on;
++}
++/* Is the word at `ea` a JUMP to its own IO offset? Cheap: only with GCM_RECDBG. */
++int gcm_park_word_at(u32 ea)
++{
++    if (!gcm_recdbg_on()) return 0;
++    const u32 io = gcm_ea2io(ea);
++    if (io == 0xFFFFFFFFu) return 0;
++    const u32 w = vm_read32(ea);
++    return (w & 0xE0000003u) == 0x20000000u && (w & 0x1FFFFFFCu) == io;
++}
++void gcm_note_spu_unpark(u32 ea, u32 word)
++{
++    extern unsigned long long ps3_ms_now(void);
++    const unsigned i = __atomic_fetch_add(&s_unpark_n, 1u, __ATOMIC_RELAXED) % 256u;
++    s_unparks[i].ea = ea; s_unparks[i].word = word; s_unparks[i].ms = ps3_ms_now();
++}
++
+ static void gcm_fifo_resync_why(const char* why, u32* getoff, u32 put)
+ {
++    /* The walker lands on the title's write head: any wrap JUMPs it skips
++     * are not owed any more. */
++    s_ring_jumps_head = s_ring_jumps_tail;
+     static int n = 0;
+     if (PS3_LOG_FIRST(n, 8))
+         fprintf(stderr, "[cellGcmSys] FIFO resync (%s) 0x%08X -> put 0x%08X\n",
+@@ -2276,8 +2322,19 @@ static void gcm_rsx_process_fifo_unlocked(void)
+          * run out, so the jump-park resync fired at once and dropped the
+          * commands the title was about to link in. */
+         if (park_off && (s_fifo_getoff != park_off ||
+-                         (w & 0xE0000003u) != 0x20000000u || (w & 0x1FFFFFFCu) != park_off))
++                         (w & 0xE0000003u) != 0x20000000u || (w & 0x1FFFFFFCu) != park_off)) {
++            /* GCM_RECDBG: how long parks stand before they are patched. */
++            static int dbg = -1;
++            if (dbg < 0) dbg = getenv("GCM_RECDBG") ? 1 : 0;
++            if (dbg) {
++                extern unsigned long long ps3_ms_now(void);
++                const unsigned long long held = ps3_ms_now() - park_since;
++                if (held >= 20)
++                    fprintf(stderr, "[PARK] released 0x%08X after %llu ms (now 0x%08X)\n",
++                            park_off, held, w);
++            }
+             park_off = 0;
++        }
+ 
+         if ((w & 0xFFFF0000u) == 0xFEAD0000u) {
+             /* lv1 driver flip: statically-linked libgcm cellGcmSetFlip writes
+@@ -2369,7 +2426,33 @@ static void gcm_rsx_process_fifo_unlocked(void)
+                       const unsigned long long now = ps3_ms_now();
+                       if (park_off != s_fifo_getoff || park_put != put) {
+                           park_off = s_fifo_getoff; park_put = put; park_since = now;
+-                      } else if (now - park_since >= gcm_park_grace_ms() &&
++                      } else if (now - park_since >= 1000 && now - park_since < 1100) {
++                          /* GCM_RECDBG: a park that stands for a second. */
++                          static int dbg = -1;
++                          if (dbg < 0) dbg = getenv("GCM_RECDBG") ? 1 : 0;
++                          if (dbg) {
++                              fprintf(stderr, "[PARK] 0x%08X put=0x%08X ctx.current=0x%08X laps=%u for %llu ms\n",
++                                      s_fifo_getoff, put,
++                                      s_gcm_context_ea ? vm_read32(s_gcm_context_ea + 0x8) : 0,
++                                      gcm_ring_laps_behind(), now - park_since);
++                              const u32 ea = gcm_io2ea(s_fifo_getoff);
++                              { const u32 pea = gcm_io2ea(s_fifo_getoff); int hits = 0;
++                                for (unsigned k = 0; k < 256; k++)
++                                    if (s_unparks[k].ea == pea && s_unparks[k].ms) {
++                                        hits++;
++                                        fprintf(stderr, "[PARK] SPU unparked 0x%08X with %08X %llu ms ago\n",
++                                                pea, s_unparks[k].word, now - s_unparks[k].ms);
++                                    }
++                                fprintf(stderr, "[PARK] %d recorded SPU unparks of this address (of %u total)\n",
++                                        hits, s_unpark_n); }
++                              fprintf(stderr, "[PARK] words:");
++                              for (u32 k = 0; ea && k < 16; k++)
++                                  fprintf(stderr, " %08X", vm_read32(ea - 16 + 4 * k));
++                              fprintf(stderr, "\n");
++                          }
++                      }
++                      if (park_off == s_fifo_getoff && park_put == put &&
++                                 now - park_since >= gcm_park_grace_ms() &&
+                                  /* Read the park again before giving up on it.
+                                   * An SPU job that fills a command-buffer hole
+                                   * (Edge geometry reserves them as self-JUMPs)
+@@ -2387,6 +2470,9 @@ static void gcm_rsx_process_fifo_unlocked(void)
+                   break;
+               }
+               if (tgt < s_fifo_getoff) s_fifo_back_jumps++;
++              if (gcm_ring_laps_behind() &&
++                  s_ring_jumps[s_ring_jumps_head % GCM_RING_LAPS] == s_fifo_getoff)
++                  s_ring_jumps_head++;
+               s_fifo_getoff = tgt;
+               /* get is the RSX's fetch pointer: a title polling it sees the
+                * GPU leave a segment as soon as the JUMP out of it is taken.
+@@ -2769,6 +2855,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
+      * per tick (gcm_ref_push/gcm_ref_publish_one above) so every SET_REFERENCE
+      * value stays observable to equality-waiters. The wrap recycle path polls
+      * the drained EA. */
++    s_last_drain_why = why;
+     if (s_draindbg) {
+         static int n2 = 0;
+         if (n2++ % s_drain_every == 0)
+@@ -2798,6 +2885,9 @@ static void gcm_rsx_process_fifo_unlocked(void)
+         u32 begin = ctx ? vm_read32(ctx + 0x0) : 0;
+         u32 end   = ctx ? vm_read32(ctx + 0x4) : 0;
+         u32 cur   = ctx ? vm_read32(ctx + 0x8) : 0;
++        /* ctx->end is the callback's limit, not the ring's end: reaching it
++         * is the callback's cue, not an overrun. */
++        if (s_ring_end_ea && end < s_ring_end_ea) end = s_ring_end_ea;
+         /* `get == put` -- a fully drained FIFO -- was too strict. It holds
+          * while a title is only clearing, and stops holding the moment its SPU
+          * work starts producing real command volume: the walker then always has
+@@ -2901,10 +2991,40 @@ static u32 gcm_ea2io(u32 ea)
+     return ((u32)io_page << 20) | (ea & 0xFFFFFu);
+ }
+ 
++/* Ring geometry for the title's buffer-full callback (cellGcm_fifo_recycle),
++ * which hands the title its ring the way the SDK's default callback does:
++ * after a wrap the title may write from `begin` up to where the RSX is still
++ * reading the previous lap, and ctx->end is lowered to say so. The RSX never
++ * waits for the title and the title never writes over commands the RSX has
++ * not read.
++ *
++ * s_ring_end_ea   the ring's real end: ctx->end as the title first set it.
++ * s_ring_jumps    the wrap JUMPs the walker still owes (see above). */
++/* Room the callback must give the title before it returns: more than the
++ * largest single reserve (a method header carries at most 2047 words). */
++#define GCM_RING_MIN_ROOM 0x10000u
++/* Distance kept between the title's limit and the walker. */
++#define GCM_RING_GUARD    0x1000u
++
++/* Where the title may write up to now, as an EA (begin when it may not write
++ * at all), or 0 while that cannot be known. On the title's lap the walker is
++ * behind it and the whole ring is free; one lap behind, the title may write
++ * up to the walker; two laps behind, nothing until it catches up. */
++static u32 gcm_ring_limit(u32 begin, u32 current)
++{
++    const unsigned laps = gcm_ring_laps_behind();
++    if (laps == 0) return s_ring_end_ea;
++    if (laps > 1) return begin;
++    const u32 g = gcm_io2ea(s_fifo_getoff);
++    if (!g || g < current || g > s_ring_end_ea) return 0;   /* in a CALL, or resynced */
++    return g > begin + GCM_RING_GUARD ? g - GCM_RING_GUARD : begin;
++}
++
+ void cellGcm_fifo_recycle(u32 ctx_ea)
+ {
+     if (!ctx_ea) return;
+     u32 begin   = vm_read32(ctx_ea + 0x0);
++    u32 end     = vm_read32(ctx_ea + 0x4);
+     u32 current = vm_read32(ctx_ea + 0x8);
+     if (current <= begin) return;                       /* nothing to recycle */
+ 
+@@ -2914,69 +3034,64 @@ void cellGcm_fifo_recycle(u32 ctx_ea)
+     static int s_recdbg = -1;
+     if (s_recdbg < 0) s_recdbg = getenv("GCM_RECDBG") ? 1 : 0;
+     if (s_recdbg)
+-        fprintf(stderr, "[REC>] tid=%lu begin=%08X cur=%08X put=%08X get=%08X drained=%08X\n",
+-                GetCurrentThreadId(), begin, current,
+-                vm_read32(GCM_CONTROL_GUEST_ADDR + 0),
+-                vm_read32(GCM_CONTROL_GUEST_ADDR + 4),
+-                g_gcm_fifo_drained_ea);
+-
+-    /* Do what the SDK's default command-buffer-full callback does: append a
+-     * JUMP-to-begin at the write head and move `put` to begin. The FIFO walker
+-     * consumes the tail, follows the jump, and idles at begin; then it's safe
+-     * for the guest to write from begin (that region was consumed long ago). */
+-    u32 io_begin = gcm_ea2io(begin);
+-    const u32 back_jumps0 = s_fifo_back_jumps;
+-    if (io_begin != 0xFFFFFFFFu) {
+-        vm_write32(current, 0x20000000u | io_begin);            /* JUMP begin  */
+-        /* The jump has to be in guest memory before `put` moves behind the
+-         * walker's `get`. Program order is not enough on arm64: the walker
+-         * may observe the new `put`, find `get` != `put`, and read the old
+-         * word at `current` before the jump lands there. */
++        fprintf(stderr, "[REC>] tid=%lu begin=%08X end=%08X cur=%08X put=%08X get=%08X laps=%u\n",
++                GetCurrentThreadId(), begin, end, current,
++                vm_read32(GCM_CONTROL_GUEST_ADDR + 0), s_fifo_getoff, gcm_ring_laps_behind());
++
++    const u32 io_begin = gcm_ea2io(begin);
++    const u32 io_cur = gcm_ea2io(current);
++    if (io_begin == 0xFFFFFFFFu || io_cur == 0xFFFFFFFFu) return;
++    if (!s_ring_end_ea || end > s_ring_end_ea) s_ring_end_ea = end;
++    /* The drain thread rewinds a ring whose `current` reaches `end` for titles
++     * whose callback never does; this one does, so keep it out. */
++    s_fifo_recycle_waiting = 1;
++
++    /* Publish everything written so far: the SDK callback flushes first. */
++    atomic_thread_fence(memory_order_release);
++    vm_write32(GCM_CONTROL_GUEST_ADDR + 0, io_cur);
++
++    if (current + GCM_RING_MIN_ROOM > s_ring_end_ea) {
++        /* At the ring's end: wrap. The JUMP sits at the write head, past
++         * `put`, so the walker runs the tail, stops in front of it, and takes
++         * it once the title flushes from `begin`. Nothing is waited for here:
++         * the limit below keeps the title off what the walker still owes. */
++        if (gcm_ring_laps_behind() >= GCM_RING_LAPS) {   /* cannot happen: the limit */
++            s_fifo_recycle_waiting = 0;
++            return;
++        }
++        vm_write32(current, 0x20000000u | io_begin);    /* JUMP begin */
++        s_ring_jumps[s_ring_jumps_tail % GCM_RING_LAPS] = io_cur;
+         atomic_thread_fence(memory_order_release);
+-        vm_write32(GCM_CONTROL_GUEST_ADDR + 0, io_begin);        /* put = begin */
++        s_ring_jumps_tail++;
++        current = begin;
++        vm_write32(ctx_ea + 0x8, begin);
+     }
+ 
+-    /* Wait (bounded ~2s) for the walker to consume the tail + take the jump so
+-     * no commands are lost; a stalled ticker degrades to dropped commands.
+-     * "Took the jump" is a backward JUMP counted after the one written above.
+-     * Comparing the drained EA with begin let the wait through at once when
+-     * the walker had not moved yet (drained starts at begin), and the title
+-     * then overwrote megabytes of commands the RSX had never read. */
+-    /* The bound is on the walker making no progress, not on the total wait: a
+-     * title that fills a 3 MB ring with hundreds of tiny frames at boot (God of
+-     * War HD) leaves a backlog the draw engine needs tens of seconds to execute,
+-     * and giving up after 2 s handed the title megabytes of commands to write
+-     * over. A walker that has stopped moving still ends the wait after 2 s, and
+-     * 60 s caps the whole thing. */
+-    int spins = 0, idle = 0;
+-    u32 last_get = s_fifo_getoff;
+-    s_fifo_recycle_waiting = 1;
+-    while (io_begin != 0xFFFFFFFFu && s_fifo_back_jumps == back_jumps0 &&
+-           idle < 2000 && spins < 60000) {
+-        Sleep(1); spins++;
+-        if (s_fifo_getoff != last_get) { last_get = s_fifo_getoff; idle = 0; }
+-        else idle++;
+-        if (s_recdbg && spins % 1000 == 0)
+-            fprintf(stderr, "[REC~] %d ms: walker get=%08X put=%08X back_jumps=%u\n",
+-                    spins, s_fifo_getoff, vm_read32(GCM_CONTROL_GUEST_ADDR + 0),
+-                    s_fifo_back_jumps);
+-    }
+-    if (s_fifo_back_jumps == back_jumps0 && io_begin != 0xFFFFFFFFu) {
+-        static int warned = 0;
+-        if (PS3_LOG_FIRST(warned, 4))
+-            printf("[cellGcmSys] fifo recycle: drain stalled (drained=0x%08X begin=0x%08X, %d ms)\n",
+-                   g_gcm_fifo_drained_ea, begin, spins);
++    /* Give the title room, waiting for the walker when there is too little.
++     * A walker parked on a hole the title fills later (Digger HD reserves them
++     * for its SPU work) moves once the title runs again, so room is never
++     * waited for beyond the minimum. */
++    int waited = 0;
++    u32 limit;
++    for (;;) {
++        limit = gcm_ring_limit(begin, current);
++        if (limit > current && limit - current >= GCM_RING_MIN_ROOM) break;
++        Sleep(1); waited++;
++        if (waited % 1000 == 0) {
++            static int warned = 0;
++            if (PS3_LOG_FIRST(warned, 8))
++                printf("[cellGcmSys] fifo recycle: waiting %d ms for room "
++                       "(cur=0x%08X get=0x%08X why=%s)\n", waited, current,
++                       s_fifo_getoff, s_last_drain_why);
++        }
+     }
+-
+-    vm_write32(ctx_ea + 0x8, begin);                    /* recycle ring to base */
+-    s_fifo_recycle_waiting = 0;                          /* current no longer reads end */
++    vm_write32(ctx_ea + 0x4, limit);
++    s_fifo_recycle_waiting = 0;
+ 
+     if (s_recdbg)
+-        fprintf(stderr, "[REC<] tid=%lu cur-now=%08X put=%08X get=%08X drained=%08X spins=%d\n",
+-                GetCurrentThreadId(), vm_read32(ctx_ea + 0x8),
+-                vm_read32(GCM_CONTROL_GUEST_ADDR + 0),
+-                vm_read32(GCM_CONTROL_GUEST_ADDR + 4),
+-                g_gcm_fifo_drained_ea, spins);
++        fprintf(stderr, "[REC<] cur=%08X end=%08X put=%08X get=%08X laps=%u waited=%d\n",
++                vm_read32(ctx_ea + 0x8), limit, vm_read32(GCM_CONTROL_GUEST_ADDR + 0),
++                s_fifo_getoff, gcm_ring_laps_behind(), waited);
+ }
+ 
+ /* A host that brings its backend up on another thread -- a frame clock that
+@@ -3171,8 +3286,18 @@ static int gcm_flip_into_fifo(u32 ctx, u32 bufferId)
+     const u32 begin = vm_read32(ctx), io_begin = gcm_ea2io(begin);
+     const u32 cb_opd = vm_read32(ctx + 0xC);
+     const int runtime_ring = cb_opd && vm_read32(cb_opd) == GCM_FIFO_CALLBACK_SENTINEL_EA;
+-    if (runtime_ring && end - (cur + 4) < GCM_FLIP_WRAP_BYTES && io_begin != 0xFFFFFFFFu &&
+-        s_fifo_getoff >= io_begin + GCM_RECYCLE_MARGIN) {
++    /* ...and only once the walker has executed everything up to here. After
++     * the rewind the title may write the whole ring before it next calls
++     * back, and nothing stops it at the walker: with commands still
++     * unexecuted between `get` and here it overwrites them once it has
++     * written as far as `get`. Digger HD did, on the frame that loads its
++     * first level (hundreds of KB of programs and constants while the walker
++     * lagged), and the walker read a float constant (0x3F800000) as a JUMP and
++     * stopped for good. Otherwise the ring wraps through the buffer-full
++     * callback (cellGcm_fifo_recycle), which waits for the walker. */
++    const u32 io_cur = gcm_ea2io(cur);
++    if (runtime_ring && !s_ring_end_ea && end - (cur + 4) < GCM_FLIP_WRAP_BYTES && io_begin != 0xFFFFFFFFu &&
++        s_fifo_getoff >= io_begin + GCM_RECYCLE_MARGIN && s_fifo_getoff >= io_cur) {
+         vm_write32(cur + 4, 0x20000000u | io_begin);   /* JUMP -> begin */
+         vm_write32(ctx + 8, begin);
+         return 1;
+@@ -3206,14 +3331,22 @@ s32 cellGcmSetFlipCommandWithWaitLabel(u32 bufferId, u32 labelIndex, u32 labelVa
+ /* NID: 0xA2478CA3 */
+ s32 cellGcmSetPrepareFlip(void* ctx, u32 bufferId)
+ {
+-    (void)ctx;  /* command buffer context -- not used in HLE */
+-
+     if (bufferId >= CELL_GCM_MAX_DISPLAY_BUFFER_NUM)
+         return CELL_GCM_ERROR_INVALID_VALUE;
+ 
+     if (!s_display_buffer_set[bufferId])
+         return CELL_GCM_ERROR_INVALID_VALUE;
+ 
++    /* Like _cellGcmSetFlipCommand, the real call appends the flip to the
++     * context, and the flip status stays WAITING until the RSX reaches it.
++     * Completing it here, at call time, let a title that paces itself on
++     * cellGcmGetFlipStatus run on unpaced: Digger HD queued ~130 frames per
++     * presented one, filled its ring and then waited for the drain to work
++     * through all of them, about one frame shown per 800 ms. Fall back to
++     * the immediate form below when ctx is not a mapped command buffer. */
++    if (gcm_flip_into_fifo((u32)(uintptr_t)ctx, bufferId))
++        return gcm_flip_request(bufferId, 1);
++
+     printf("[cellGcmSys] SetPrepareFlip(bufferId=%u)\n", bufferId);
+ 
+     gcm_set_current_display_buffer(bufferId);

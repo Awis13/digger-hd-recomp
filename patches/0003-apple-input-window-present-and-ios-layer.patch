@@ -1,0 +1,1588 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 250d8d2c..d687a884 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -165,10 +165,15 @@ endif()
+ if(APPLE)
+     target_link_libraries(ps3recomp_runtime PUBLIC
+         "-framework Metal"
++        "-framework MetalFX"
+         "-framework QuartzCore"
+         "-framework Foundation"
+-        "-framework AppKit"
+     )
++    if(CMAKE_SYSTEM_NAME MATCHES "^(iOS|tvOS)$")
++        target_link_libraries(ps3recomp_runtime PUBLIC "-framework UIKit")
++    else()
++        target_link_libraries(ps3recomp_runtime PUBLIC "-framework AppKit")
++    endif()
+     set_source_files_properties(
+         "${CMAKE_CURRENT_SOURCE_DIR}/libs/video/rsx_metal_backend.m"
+         PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
+diff --git a/libs/input/cellPad.c b/libs/input/cellPad.c
+index afdd93de..5a1bdc7d 100644
+--- a/libs/input/cellPad.c
++++ b/libs/input/cellPad.c
+@@ -12,6 +12,7 @@
+  */
+ 
+ #include <time.h>
++#include <sys/stat.h>
+ #include "cellPad.h"
+ #include <stdio.h>
+ #include <stdlib.h>
+@@ -419,6 +420,61 @@ static void pad_shutdown_backend(void)
+ 
+ #endif /* PAD_BACKEND_XINPUT */
+ 
++#if defined(__APPLE__)
++/* The same fallback on macOS. There is no GetAsyncKeyState; the Metal
++ * backend's event pump (rsx_metal_backend.m) records key-down/up for the
++ * game window here, indexed by macOS virtual key code, and clears it all when
++ * the app stops being active. Reading only what the window received keeps
++ * typing in another application away from the game and needs no Input
++ * Monitoring permission. */
++_Atomic unsigned char g_host_key_down[128];
++
++static void pad_poll_keyboard(void)
++{
++    static int off = -1;
++    if (off < 0) off = getenv("PAD_NO_KEYBOARD") ? 1 : 0;
++    if (off) return;
++
++    /* A PC game's keys, by macOS virtual key code (HIToolbox Events.h,
++     * kVK_*): arrows or WASD move, Space is cross (Digger HD fires and
++     * confirms with it), Return is START, Escape is circle (back). */
++    static const struct { unsigned char vk; u16 btn; } map[] = {
++        { 0x7E, CELL_PAD_CTRL_UP },     { 0x7D, CELL_PAD_CTRL_DOWN },       /* arrows */
++        { 0x7B, CELL_PAD_CTRL_LEFT },   { 0x7C, CELL_PAD_CTRL_RIGHT },
++        { 0x0D, CELL_PAD_CTRL_UP },     { 0x01, CELL_PAD_CTRL_DOWN },       /* W S */
++        { 0x00, CELL_PAD_CTRL_LEFT },   { 0x02, CELL_PAD_CTRL_RIGHT },      /* A D */
++        { 0x31, CELL_PAD_CTRL_CROSS },                                      /* Space */
++        { 0x35, CELL_PAD_CTRL_CIRCLE }, { 0x33, CELL_PAD_CTRL_CIRCLE },     /* Escape, Delete */
++        { 0x0C, CELL_PAD_CTRL_SQUARE }, { 0x0E, CELL_PAD_CTRL_TRIANGLE },   /* Q E */
++        { 0x24, CELL_PAD_CTRL_START },  { 0x4C, CELL_PAD_CTRL_START },      /* Return, keypad Enter */
++        { 0x23, CELL_PAD_CTRL_START },                                      /* P */
++        { 0x30, CELL_PAD_CTRL_SELECT },                                     /* Tab */
++        { 0x12, CELL_PAD_CTRL_L1 },     { 0x13, CELL_PAD_CTRL_R1 },         /* 1 2 */
++        { 0x14, CELL_PAD_CTRL_L2 },     { 0x15, CELL_PAD_CTRL_R2 },         /* 3 4 */
++    };
++
++    PadHostState* hs = &s_host_state[0];
++    u16 btns = 0;
++    for (unsigned i = 0; i < sizeof map / sizeof map[0]; i++)
++        if (g_host_key_down[map[i].vk]) btns |= map[i].btn;
++
++    hs->buttons   = btns;
++    hs->connected = 1;
++    hs->analog_lx = (u8)((btns & CELL_PAD_CTRL_LEFT) ? 0 :
++                         (btns & CELL_PAD_CTRL_RIGHT) ? 255 : 128);
++    hs->analog_ly = (u8)((btns & CELL_PAD_CTRL_UP) ? 0 :
++                         (btns & CELL_PAD_CTRL_DOWN) ? 255 : 128);
++    hs->analog_rx = hs->analog_ry = 128;
++    hs->trigger_l2 = (u8)((btns & CELL_PAD_CTRL_L2) ? 255 : 0);
++    hs->trigger_r2 = (u8)((btns & CELL_PAD_CTRL_R2) ? 255 : 0);
++
++    { static int said = 0;
++      if (!said && btns) { said = 1;
++          printf("[cellPad] keyboard fallback active on port 0 (no game controller)\n");
++          fflush(stdout); } }
++}
++#endif
++
+ /* ---------------------------------------------------------------------------
+  * SDL2 backend
+  * -----------------------------------------------------------------------*/
+@@ -500,6 +556,13 @@ static void pad_sdl_close(int p, int gone)
+     pad_host_release(&s_host_state[p]);
+ }
+ 
++/* The Apple TV remote, which SDL lists as a game controller. */
++static int pad_sdl_is_remote(SDL_GameController* gc)
++{
++    const char* n = gc ? SDL_GameControllerName(gc) : NULL;
++    return n && strstr(n, "Remote") != NULL;
++}
++
+ /* Open every game controller SDL lists that no port has yet. */
+ static void pad_sdl_scan(void)
+ {
+@@ -530,6 +593,23 @@ static void pad_sdl_scan(void)
+         fprintf(stderr, "[cellPad] SDL controller %s on port %d: %s (instance %d)%s\n",
+                 back ? "reconnected" : "connected", port, name ? name : "?", (int)id,
+                 SDL_GameControllerHasRumble(gc) ? "" : " (no rumble)");
++        /* An Apple TV's Siri Remote is always there first and took port 0, so
++         * a real game controller connected next landed on port 1, which a
++         * one-player title never reads. A game controller takes the lowest
++         * port a remote holds; the remote moves up to its port. */
++        if (!pad_sdl_is_remote(gc)) {
++            for (int p = 0; p < port; p++) {
++                if (!s_sdl_controllers[p] || !pad_sdl_is_remote(s_sdl_controllers[p])) continue;
++                SDL_GameController* tg = s_sdl_controllers[p]; s_sdl_controllers[p] = s_sdl_controllers[port]; s_sdl_controllers[port] = tg;
++                SDL_JoystickID ti = s_sdl_ids[p]; s_sdl_ids[p] = s_sdl_ids[port]; s_sdl_ids[port] = ti;
++                SDL_JoystickGUID tu = s_sdl_last_guid[p]; s_sdl_last_guid[p] = s_sdl_last_guid[port]; s_sdl_last_guid[port] = tu;
++                pad_host_release(&s_host_state[p]);
++                pad_host_release(&s_host_state[port]);
++                fprintf(stderr, "[cellPad] %s moved to port %d, the remote to port %d\n",
++                        name ? name : "?", p, port);
++                break;
++            }
++        }
+     }
+ }
+ 
+@@ -643,6 +723,13 @@ static void pad_init_backend(void)
+              * cared. SDL_JOYSTICK_ALLOW_BACKGROUND_EVENTS=0 in the
+              * environment still wins over this. */
+             SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, "1");
++            /* A DualShock 3 needs SDL's own HIDAPI driver: the OS has no
++             * game-controller support for it on macOS. SetHintWithPriority at
++             * default priority, so the environment still wins. */
++            SDL_SetHintWithPriority(SDL_HINT_JOYSTICK_HIDAPI_PS3, "1", SDL_HINT_DEFAULT);
++            /* Map by position, not by printed label: the bottom face button is
++             * cross on every pad, including Nintendo's, whose A is on the right. */
++            SDL_SetHintWithPriority(SDL_HINT_GAMECONTROLLER_USE_BUTTON_LABELS, "0", SDL_HINT_DEFAULT);
+             SDL_InitSubSystem(SDL_INIT_GAMECONTROLLER);
+         }
+         s_sdl_inited = 1;
+@@ -693,6 +780,162 @@ static unsigned long long pad_now_ms(void)
+ #endif
+ }
+ 
++/* PAD_SCRIPT=<file>: drive port 0 from a timed script, for unattended runs
++ * that must get past menus and play. Each line is "<ms> <buttons>": from <ms>
++ * on the host monotonic clock (CLOCK_MONOTONIC, in milliseconds), hold
++ * <buttons> (a CELL_PAD_CTRL_* mask, hex or decimal) until the next line's
++ * time. Blank lines and lines starting with '#' are skipped; lines must be in
++ * time order. The file is re-read when it changes, so a test harness can
++ * append presses as it sees the screens they answer. While the variable is set
++ * the script replaces every other input on port 0, pressing nothing before its
++ * first line. The clock is printed once at the first poll for alignment. */
++#define PAD_SCRIPT_MAX 4096
++static struct { unsigned long long ms; u16 btn; } s_script[PAD_SCRIPT_MAX];
++static int s_script_n = -1;          /* -1: PAD_SCRIPT not looked at yet */
++static const char* s_script_path;
++static long long s_script_mtime = -1;
++static unsigned long long s_script_checked;
++
++/* Modification time in nanoseconds: a harness appends within one second. */
++static long long pad_file_mtime_ns(const struct stat* st)
++{
++#if defined(__APPLE__)
++    return (long long)st->st_mtimespec.tv_sec * 1000000000ll + st->st_mtimespec.tv_nsec;
++#elif defined(_WIN32)
++    return (long long)st->st_mtime * 1000000000ll;
++#else
++    return (long long)st->st_mtim.tv_sec * 1000000000ll + st->st_mtim.tv_nsec;
++#endif
++}
++
++static void pad_script_load(void)
++{
++    struct stat st;
++    if (stat(s_script_path, &st) != 0) return;
++    if (pad_file_mtime_ns(&st) == s_script_mtime) return;
++    FILE* f = fopen(s_script_path, "r");
++    if (!f) return;
++    s_script_mtime = pad_file_mtime_ns(&st);
++    int n = 0;
++    char line[256];
++    while (n < PAD_SCRIPT_MAX && fgets(line, sizeof line, f)) {
++        char* p = line;
++        while (*p == ' ' || *p == '\t') p++;
++        if (*p == '#' || *p == '\n' || *p == '\r' || !*p) continue;
++        char* e;
++        unsigned long long ms = strtoull(p, &e, 0);
++        if (e == p) continue;
++        s_script[n].ms = ms;
++        s_script[n].btn = (u16)strtoul(e, NULL, 0);
++        n++;
++    }
++    fclose(f);
++    s_script_n = n;
++}
++
++static unsigned long long pad_mono_ms(void)
++{
++#ifdef _WIN32
++    return (unsigned long long)GetTickCount64();
++#else
++    struct timespec ts;
++    clock_gettime(CLOCK_MONOTONIC, &ts);
++    return (unsigned long long)ts.tv_sec * 1000ull +
++           (unsigned long long)ts.tv_nsec / 1000000ull;
++#endif
++}
++
++static void pad_poll_script(unsigned long long now)
++{
++    (void)now;
++    if (s_script_n < 0) {
++        s_script_path = getenv("PAD_SCRIPT");
++        if (!s_script_path || !*s_script_path) { s_script_path = NULL; s_script_n = 0; return; }
++        s_script_n = 0;
++        printf("[cellPad] PAD_SCRIPT %s: clock %llu ms\n", s_script_path, pad_mono_ms());
++        fflush(stdout);
++    }
++    if (!s_script_path) return;
++    const unsigned long long t = pad_mono_ms();
++    if (t - s_script_checked >= 100) { s_script_checked = t; pad_script_load(); }
++    u16 btns = 0;
++    int i = 0;
++    while (i < s_script_n && s_script[i].ms <= t) i++;
++    if (i > 0) btns = s_script[i - 1].btn;
++    { static int last = -1;
++      if (i != last) { last = i;
++          printf("[cellPad] PAD_SCRIPT t=%llu ms step %d buttons=0x%04X\n", t, i, btns);
++          fflush(stdout); } }
++    PadHostState* hs = &s_host_state[0];
++    hs->buttons   = btns;
++    hs->connected = 1;
++    hs->analog_lx = (u8)((btns & CELL_PAD_CTRL_LEFT) ? 0 :
++                         (btns & CELL_PAD_CTRL_RIGHT) ? 255 : 128);
++    hs->analog_ly = (u8)((btns & CELL_PAD_CTRL_UP) ? 0 :
++                         (btns & CELL_PAD_CTRL_DOWN) ? 255 : 128);
++    hs->analog_rx = hs->analog_ry = 128;
++    hs->trigger_l2 = (u8)((btns & CELL_PAD_CTRL_L2) ? 255 : 0);
++    hs->trigger_r2 = (u8)((btns & CELL_PAD_CTRL_R2) ? 255 : 0);
++}
++
++/* PAD_AUTOPLAY=1: the Mac playtest's route (tools/playtest.py) run on the
++ * device itself, for one nobody can sit at. The Metal backend recognises the
++ * screen from the frame against the playtest's reference thumbnails
++ * (tools/make_autoplay_refs.py) and publishes it here; this answers it as
++ * the playtest does -- START on the title, cross in the menu, circle in a
++ * pause, square on game over, and in a level a random direction for
++ * 0.3-1.2 s every 0.4 s with fire on a third of them. OR-ed onto port 0, so
++ * a controller in a hand still works. */
++volatile int g_autoplay_screen = -1;
++/* The iOS host sends these lines over the network (PS3_PERF_UDP); elsewhere
++ * there is nothing to send them to. */
++__attribute__((weak)) void ps3_perf_udp(const char* line) { (void)line; }   /* intro 0 title 1 menu 2 level 3 pause 4 gameover 5 */
++
++static void pad_poll_autoplay(unsigned long long now)
++{
++    static int on = -1, last = -2;
++    static unsigned long long next, until;
++    static u16 mask, injected;
++    static unsigned rng = 12345u;
++    if (on < 0) on = getenv("PAD_AUTOPLAY") ? 1 : 0;
++    if (!on) return;
++    const int sc = g_autoplay_screen;
++    if (sc != last) {
++        static const char* const names[6] = { "intro", "title", "menu", "level", "pause", "gameover" };
++        char line[64];
++        snprintf(line, sizeof line, "[autoplay] screen %s\n", sc >= 0 && sc < 6 ? names[sc] : "?");
++        fputs(line, stdout);
++        ps3_perf_udp(line);
++        last = sc;
++    }
++    if (now >= next) {
++        rng = rng * 1103515245u + 12345u;
++        const unsigned r = rng >> 8;
++        switch (sc) {
++        case 1: mask = CELL_PAD_CTRL_START;  until = now + 200; next = now + 3000; break;
++        case 2: mask = CELL_PAD_CTRL_CROSS;  until = now + 200; next = now + 3000; break;
++        case 4: mask = CELL_PAD_CTRL_CIRCLE; until = now + 200; next = now + 3000; break;
++        case 5: mask = CELL_PAD_CTRL_SQUARE; until = now + 200; next = now + 3000; break;
++        case 3: {
++            static const u16 dir[4] = { CELL_PAD_CTRL_UP, CELL_PAD_CTRL_DOWN,
++                                        CELL_PAD_CTRL_LEFT, CELL_PAD_CTRL_RIGHT };
++            mask = dir[r & 3];
++            if (((r >> 2) % 10) < 3) mask |= CELL_PAD_CTRL_CROSS;
++            until = now + 300 + (r >> 4) % 900; next = now + 400;
++            break; }
++        default: mask = 0; next = now + 200; break;
++        }
++    }
++    PadHostState* hs = &s_host_state[0];
++    const u16 m = now < until ? mask : 0;
++    if (m && !hs->connected) {
++        hs->connected = 1;
++        hs->analog_lx = hs->analog_ly = hs->analog_rx = hs->analog_ry = 128;
++    }
++    hs->buttons = (u16)((hs->buttons & ~injected) | m);
++    injected = m;
++}
++
+ static void pad_poll_backend(void)
+ {
+     static unsigned long long s_last_ms = 0;
+@@ -710,9 +953,11 @@ static void pad_poll_backend(void)
+ #elif PAD_BACKEND_SDL2
+     pad_poll_sdl2();
+ #endif
+-#ifdef _WIN32
++#if defined(_WIN32) || defined(__APPLE__)
+     if (!s_host_state[0].connected) pad_poll_keyboard();
+ #endif
++    pad_poll_script(now);
++    pad_poll_autoplay(now);
+     pad_track_assign();
+     pad_unlock();
+ }
+@@ -855,6 +1100,13 @@ skip_inject: ;
+ 
+     {
+     PadHostState* hs = &s_host_state[port_no];
++    /* Every change of a port's buttons goes to the log, so whether a
++     * controller reaches the title at all can be read off without a debugger. */
++    { static u16 s_logged[8]; static unsigned s_lines;
++      if (port_no < 8 && hs->buttons != s_logged[port_no] && s_lines < 400) {
++          s_logged[port_no] = hs->buttons; s_lines++;
++          printf("[cellPad] port %u buttons 0x%04X\n", port_no, hs->buttons);
++      } }
+     u32 setting = s_port_setting[port_no];
+ 
+     /* Determine data length based on port settings */
+diff --git a/libs/video/rsx_metal_backend.m b/libs/video/rsx_metal_backend.m
+index ad8db0b5..b4541a72 100644
+--- a/libs/video/rsx_metal_backend.m
++++ b/libs/video/rsx_metal_backend.m
+@@ -49,6 +49,7 @@
+ #import <Metal/Metal.h>
+ #import <QuartzCore/CAMetalLayer.h>
+ #import <QuartzCore/QuartzCore.h>
++#import <MetalFX/MetalFX.h>
+ #if !TARGET_OS_IPHONE
+ #  import <AppKit/AppKit.h>
+ #endif
+@@ -62,7 +63,9 @@
+ #include <unistd.h>
+ #include <mach/mach.h>
+ #include <mach/mach_time.h>
+-#include <servers/bootstrap.h>
++#if !TARGET_OS_IPHONE
++#include <servers/bootstrap.h>    /* host surfaces: the launcher's port */
++#endif
+ #include <IOSurface/IOSurfaceRef.h>
+ #include "rsx_host_surface.h"
+ #include "rsx_commands.h"
+@@ -86,7 +89,19 @@ static id<MTLCommandQueue> s_queue;
+ static CAMetalLayer*       s_layer;      /* windowed only   */
+ static id<MTLTexture>      s_offscreen;  /* headless only   */
+ static id<MTLTexture>      s_depth;      /* depth + stencil, both surfaces  */
++#if !TARGET_OS_IPHONE
+ static NSWindow*           s_window;
++#else
++/* iOS: the app owns the view and hands its CAMetalLayer over before the
++ * backend starts (rsx_metal_backend_set_ios_layer); without one the run is
++ * headless, as it always was there. The app keeps drawableSize at the view's
++ * pixel size; the present pass fits the frame into whatever that is. */
++static CAMetalLayer*       s_ios_layer;
++void rsx_metal_backend_set_ios_layer(void* layer)
++{
++    s_ios_layer = (__bridge CAMetalLayer*)layer;
++}
++#endif
+ static int                 s_headless;
+ static atomic_int          s_closed;
+ #if !TARGET_OS_IPHONE
+@@ -111,7 +126,20 @@ static dispatch_source_t   s_host_watch;          /* the launcher's exit */
+ 
+ /* Each initialization owns its counters. A drawable callback retained by the
+  * compositor can outlive shutdown without writing into a later session. */
+-#if !TARGET_OS_IPHONE
++/* PS3RECOMP_METAL_FPS=1 also reports where a second went: GPU time of all
++ * command buffers, and the mid-frame flushes that wait for the GPU. */
++static _Atomic uint64_t s_diag_gpu_ns, s_diag_flushes, s_diag_flush_wait_ns;
++static _Atomic uint64_t s_diag_passes, s_diag_draws, s_diag_mpix;   /* mpix: pass area, kilopixels */
++static _Atomic uint32_t s_diag_max_w, s_diag_max_h;
++static _Atomic uint64_t s_diag_present_gpu_ns, s_diag_present_cpu_wait_ns, s_diag_nozeta;
++static _Atomic uint64_t s_diag_shaders, s_diag_xlate_ns, s_diag_compile_ns, s_diag_psos, s_diag_pso_ns;
++static uint64_t diag_now_ns(void)
++{
++    static mach_timebase_info_data_t tb;
++    if (!tb.denom) mach_timebase_info(&tb);
++    return mach_absolute_time() * tb.numer / tb.denom;
++}
++
+ @interface MetalFrameRateSession : NSObject {
+ @public
+     pthread_mutex_t lock;
+@@ -174,13 +202,19 @@ static void fps_start(void)
+ {
+     fps_stop();
+     const char *enabled=getenv("PS3RECOMP_METAL_FPS");
++#if TARGET_OS_IPHONE
++    if (!enabled || strcmp(enabled,"1") || s_headless) return;
++#else
+     if (!enabled || strcmp(enabled,"1") || s_headless || !s_window) return;
++#endif
+     MetalFrameRateSession *session=[MetalFrameRateSession new];
+     pthread_mutex_lock(&s_fps_session_lock);
+     s_fps_session=session;
+     pthread_mutex_unlock(&s_fps_session_lock);
++#if !TARGET_OS_IPHONE
+     NSWindow *window=s_window;
+     NSString *title=[window.title copy];
++#endif
+     s_fps_timer=dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER,0,0,dispatch_get_main_queue());
+     dispatch_source_set_timer(s_fps_timer,dispatch_time(DISPATCH_TIME_NOW,NSEC_PER_SEC),NSEC_PER_SEC,50*NSEC_PER_MSEC);
+     dispatch_source_set_event_handler(s_fps_timer,^{
+@@ -188,19 +222,39 @@ static void fps_start(void)
+         pthread_mutex_lock(&session->lock);
+         MetalFrameRateSample r=metal_frame_rate_sample(&session->stats,CACurrentMediaTime());
+         pthread_mutex_unlock(&session->lock);
++#if !TARGET_OS_IPHONE
+         window.title=[NSString stringWithFormat:@"%@ | display %.1f FPS | guest %.1f FPS | %.1f ms avg / %.1f p95 / %.1f max | age %.1f s",
+             title,r.display_fps,r.guest_fps,r.average_ms,r.p95_ms,r.worst_ms,r.age_seconds];
+-        fprintf(stderr,"[RSX FPS] display=%.2f guest=%.2f avg_ms=%.2f p95_ms=%.2f max_ms=%.2f age_s=%.2f\n",
+-            r.display_fps,r.guest_fps,r.average_ms,r.p95_ms,r.worst_ms,r.age_seconds);
++#endif
++        char perf_line[512]; snprintf(perf_line,sizeof perf_line,"[RSX FPS] display=%.2f guest=%.2f avg_ms=%.2f p95_ms=%.2f max_ms=%.2f age_s=%.2f"
++            " gpu_ms_per_s=%.1f flushes=%llu flush_wait_ms=%.1f passes=%llu draws=%llu pass_mpix=%.1f max_rt=%ux%u present_gpu_ms=%.1f drawable_wait_ms=%.1f nozeta_passes=%llu"
++            " shaders=%llu xlate_ms=%.1f compile_ms=%.1f psos=%llu pso_ms=%.1f\n",
++            r.display_fps,r.guest_fps,r.average_ms,r.p95_ms,r.worst_ms,r.age_seconds,
++            atomic_exchange(&s_diag_gpu_ns,0)/1e6,
++            (unsigned long long)atomic_exchange(&s_diag_flushes,0),
++            atomic_exchange(&s_diag_flush_wait_ns,0)/1e6,
++            (unsigned long long)atomic_exchange(&s_diag_passes,0),
++            (unsigned long long)atomic_exchange(&s_diag_draws,0),
++            atomic_exchange(&s_diag_mpix,0)/1e3,
++            atomic_exchange(&s_diag_max_w,0), atomic_exchange(&s_diag_max_h,0),
++            atomic_exchange(&s_diag_present_gpu_ns,0)/1e6, atomic_exchange(&s_diag_present_cpu_wait_ns,0)/1e6,
++            (unsigned long long)atomic_exchange(&s_diag_nozeta,0),
++            (unsigned long long)atomic_exchange(&s_diag_shaders,0),
++            atomic_exchange(&s_diag_xlate_ns,0)/1e6, atomic_exchange(&s_diag_compile_ns,0)/1e6,
++            (unsigned long long)atomic_exchange(&s_diag_psos,0), atomic_exchange(&s_diag_pso_ns,0)/1e6);
++        fputs(perf_line,stderr);
++        /* PS3_PERF_LOG=<file>: the same lines in a file of their own, small
++         * enough to fetch from a device whose main log has grown large. */
++        { static FILE* pf; static int tried;
++          if (!tried) { tried = 1; const char* pp = getenv("PS3_PERF_LOG"); if (pp && *pp) pf = fopen(pp, "a"); }
++          if (pf) { fputs(perf_line, pf); fflush(pf); } }
++#if TARGET_OS_IPHONE
++        { extern void ps3_perf_udp(const char*); ps3_perf_udp(perf_line); }
++#endif
+     });
+     dispatch_resume(s_fps_timer);
+ }
+ 
+-#else
+-static void fps_track_drawable(id<CAMetalDrawable> drawable) { (void)drawable; }
+-void rsx_metal_backend_note_guest_frame(void) {}
+-#endif
+-
+ /* ---- vertex layout ----------------------------------------------------------
+  * Every draw carries all 16 RSX vertex attributes as float4, fetched on the
+  * CPU by rsx_fetch_attrib: 256 bytes per vertex, attribute i at offset i*16.
+@@ -483,7 +537,8 @@ static void mtl_set_render_target(void* ud, const rsx_state* state)
+     u32 w = state->surface_clip_w, h = state->surface_clip_h;
+     if (!w || !h || (w == s_width && h == s_height)) return;
+     s_width = w; s_height = h;
+-    if (s_layer) s_layer.drawableSize = CGSizeMake((CGFloat)w, (CGFloat)h);
++    /* The drawable follows the window's pixels (pump_messages_impl), not the
++     * guest's display buffer: the present pass scales into it. */
+     if (s_depth && create_depth() != 0)
+         fprintf(stderr, "[RSX metal] depth/stencil resize to %ux%u failed; "
+                         "the old buffer stays bound\n", w, h);
+@@ -859,10 +914,25 @@ static int create_window_impl(const char* title)
+     s_layer.pixelFormat     = MTLPixelFormatBGRA8Unorm;
+     s_layer.framebufferOnly = YES;
+     s_layer.drawableSize    = CGSizeMake((CGFloat)s_width, (CGFloat)s_height);
++    s_layer.contentsScale   = [s_window backingScaleFactor];
++    /* Keep the title's aspect when the window is resized, tiled or made full
++     * screen: fit the frame and fill the rest black, as a TV letterboxes,
++     * instead of stretching it to the window's shape. */
++    s_layer.contentsGravity = kCAGravityResizeAspect;
++    /* The title's frames are sRGB, as a PS3 sends them to a TV. Say so, or the
++     * system shows the values untranslated in the display's own space and a
++     * wide-gamut screen (P3) oversaturates them. */
++    { CGColorSpaceRef cs = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
++      s_layer.colorspace = cs;
++      CGColorSpaceRelease(cs); }
++    { CGColorRef black = CGColorCreateGenericRGB(0, 0, 0, 1);
++      s_layer.backgroundColor = black;
++      CGColorRelease(black); }
+ 
+     NSView* view = [s_window contentView];
+     [view setWantsLayer:YES];
+     [view setLayer:s_layer];
++    [s_window setCollectionBehavior:NSWindowCollectionBehaviorFullScreenPrimary];
+ 
+     [s_window makeKeyAndOrderFront:nil];
+     [NSApp activateIgnoringOtherApps:YES];
+@@ -2501,6 +2571,7 @@ static u32 s_eng_obj_count;
+ static u32 s_eng_obj_free[ENG_MAX_OBJECTS];
+ static u32 s_eng_obj_free_count;
+ static u8 s_eng_obj_retired[ENG_MAX_OBJECTS];
++static u8 s_eng_obj_bc[ENG_MAX_OBJECTS];     /* BC kind of a texture kept as RGBA8 */
+ 
+ typedef struct {
+     id<MTLRenderPipelineState> pso;
+@@ -2603,12 +2674,17 @@ static id<MTLDepthStencilState>   s_eng_clear_ds[4];
+  *                      at the guest's resolution, before the present
+  *   PS3_SHARPEN=0..1   contrast-adaptive sharpening (AMD FidelityFX CAS) in
+  *                      the present pass; 0 = off, 1 = strongest
++ *   PS3_UPSCALE=off    no MetalFX spatial upscale when the frame is enlarged
++ *                      to the window (bicubic instead); default on
+  * -1 = not read yet. */
+ static int   s_eng_fxaa = -1;
+ static float s_eng_sharpen = -1.0f;
+ static id<MTLRenderPipelineState> s_eng_fxaa_pso;
+ static MTLPixelFormat             s_eng_fxaa_pso_fmt;
+ static id<MTLTexture>             s_eng_fxaa_tex;
++static int                        s_eng_upscale = -1;
++static id<MTLFXSpatialScaler>     s_eng_mfx API_AVAILABLE(macos(13.0), ios(16.0));
++static id<MTLTexture>             s_eng_mfx_tex;
+ 
+ static float eng_sharpen_from(const char* e)
+ {
+@@ -2626,6 +2702,16 @@ static void eng_post_options(void)
+             fprintf(stderr, "[RSX metal] PS3_AA=%s unknown (fxaa); off\n", e);
+     }
+     if (s_eng_sharpen < 0.0f) s_eng_sharpen = eng_sharpen_from(getenv("PS3_SHARPEN"));
++    if (s_eng_upscale < 0) {
++        const char* e = getenv("PS3_UPSCALE");
++        s_eng_upscale = !(e && (!strcasecmp(e, "off") || !strcmp(e, "0")));
++        if (s_eng_upscale) {
++            int ok = 0;
++            if (@available(macOS 13.0, iOS 16.0, *)) ok = [MTLFXSpatialScalerDescriptor supportsDevice:s_dev];
++            if (!ok) fprintf(stderr, "[RSX metal] MetalFX spatial scaler unavailable; bicubic upscale\n");
++            s_eng_upscale = ok;
++        }
++    }
+     static int logged;
+     if (!logged++ && (s_eng_fxaa || s_eng_sharpen > 0.0f))
+         fprintf(stderr, "[RSX metal] present: AA %s, sharpen %.2f\n",
+@@ -2660,23 +2746,56 @@ static NSString* const kEngHelperMSL = @
+  * the non-scaling form: a cross whose negative weight grows where the 3x3
+  * neighbourhood has headroom), at the source's texel spacing, then the video
+  * out's gamma. sharp = 0 is the plain sample. */
+-"struct PresentP { float gamma; float sharp; float2 px; };\n"
++"struct PresentP { float gamma; float sharp; float2 px;\n"
++"                  float4 rect; float crop; float band; float2 srcsz;\n"
++"                  float mode; float3 pad; };\n"
++/* Mitchell-Netravali bicubic (B = C = 1/3) in nine bilinear taps: sharper
++ * than the compositor's bilinear stretch when the frame is enlarged to the
++ * window, without Catmull-Rom's halo around hard edges. At 1:1 it returns the
++ * texel itself. */
++"static float4 mn_w(float x) {\n"
++"    float4 d = float4(1.0 + x, x, 1.0 - x, 2.0 - x);\n"
++"    float4 n = (1.0 / 6.0) * ((7.0 / 3.0) * d * d * d - 4.0 * d * d + 16.0 / 9.0);\n"
++"    float4 f = (1.0 / 6.0) * ((-7.0 / 3.0) * d * d * d + 12.0 * d * d - 20.0 * d + 32.0 / 3.0);\n"
++"    return select(f, n, d < 1.0);\n"
++"}\n"
++"static float4 cr_sample(texture2d<float> t, sampler s, float2 uv, float2 sz) {\n"
++"    float2 p = uv * sz - 0.5; float2 f = floor(p); float2 x = p - f;\n"
++"    float4 wx = mn_w(x.x), wy = mn_w(x.y);\n"
++"    float3 cx = float3(wx.x, wx.y + wx.z, wx.w), cy = float3(wy.x, wy.y + wy.z, wy.w);\n"
++"    float3 px = float3(f.x - 0.5, f.x + 0.5 + wx.z / cx.y, f.x + 2.5) / sz.x;\n"
++"    float3 py = float3(f.y - 0.5, f.y + 0.5 + wy.z / cy.y, f.y + 2.5) / sz.y;\n"
++"    float4 c = 0.0;\n"
++"    for (int j = 0; j < 3; j++) for (int k = 0; k < 3; k++)\n"
++"        c += t.sample(s, float2(px[k], py[j])) * (cx[k] * cy[j]);\n"
++"    return c / ((cx.x + cx.y + cx.z) * (cy.x + cy.y + cy.z));\n"
++"}\n"
++/* rect: where the frame lands in the window, in window pixels (x, y, w, h);
++ * outside it is black. crop: the share of the source width cut from each
++ * side below the top band; the band (its height as a share of the source)
++ * is not cut but narrowed to the same width, so the HUD at its edges stays
++ * whole while the decorative edges of the playfield go. */
+ "fragment float4 eng_present_fs(BOut i [[stage_in]],\n"
+ "                               texture2d<float> src [[texture(0)]],\n"
+ "                               sampler s [[sampler(0)]],\n"
+ "                               constant PresentP& p [[buffer(0)]]) {\n"
+-"    float4 c = src.sample(s, i.uv);\n"
++"    float2 q = (i.pos.xy - p.rect.xy) / p.rect.zw;\n"
++"    if (any(q < 0.0) || any(q > 1.0)) return float4(0.0, 0.0, 0.0, 1.0);\n"
++"    float2 uv = float2(q.y < p.band ? q.x : p.crop + q.x * (1.0 - 2.0 * p.crop), q.y);\n"
++"    float4 c = p.mode == 1.0 ? src.read(uint2(min(floor(uv * p.srcsz), p.srcsz - 1.0)))\n"
++"             : p.mode == 2.0 ? src.sample(s, uv)\n"
++"             : cr_sample(src, s, uv, p.srcsz);\n"
+ "    if (p.sharp > 0.0) {\n"
+ "        float2 d = p.px;\n"
+-"        float3 a  = saturate(src.sample(s, i.uv + float2(-d.x, -d.y)).rgb);\n"
+-"        float3 b  = saturate(src.sample(s, i.uv + float2( 0.0, -d.y)).rgb);\n"
+-"        float3 cc = saturate(src.sample(s, i.uv + float2( d.x, -d.y)).rgb);\n"
+-"        float3 l  = saturate(src.sample(s, i.uv + float2(-d.x,  0.0)).rgb);\n"
++"        float3 a  = saturate(src.sample(s, uv + float2(-d.x, -d.y)).rgb);\n"
++"        float3 b  = saturate(src.sample(s, uv + float2( 0.0, -d.y)).rgb);\n"
++"        float3 cc = saturate(src.sample(s, uv + float2( d.x, -d.y)).rgb);\n"
++"        float3 l  = saturate(src.sample(s, uv + float2(-d.x,  0.0)).rgb);\n"
+ "        float3 e  = saturate(c.rgb);\n"
+-"        float3 r  = saturate(src.sample(s, i.uv + float2( d.x,  0.0)).rgb);\n"
+-"        float3 g  = saturate(src.sample(s, i.uv + float2(-d.x,  d.y)).rgb);\n"
+-"        float3 h  = saturate(src.sample(s, i.uv + float2( 0.0,  d.y)).rgb);\n"
+-"        float3 k  = saturate(src.sample(s, i.uv + float2( d.x,  d.y)).rgb);\n"
++"        float3 r  = saturate(src.sample(s, uv + float2( d.x,  0.0)).rgb);\n"
++"        float3 g  = saturate(src.sample(s, uv + float2(-d.x,  d.y)).rgb);\n"
++"        float3 h  = saturate(src.sample(s, uv + float2( 0.0,  d.y)).rgb);\n"
++"        float3 k  = saturate(src.sample(s, uv + float2( d.x,  d.y)).rgb);\n"
+ "        float3 mn = min(min(min(l, e), min(r, b)), h);\n"
+ "        mn += min(mn, min(min(a, cc), min(g, k)));\n"
+ "        float3 mx = max(max(max(l, e), max(r, b)), h);\n"
+@@ -2828,6 +2947,7 @@ static u32 eng_obj_add(id<MTLTexture> t)
+         slot = s_eng_obj_count++;
+     }
+     s_eng_obj[slot] = t;
++    s_eng_obj_bc[slot] = 0;
+     return slot + 1;
+ }
+ 
+@@ -2866,8 +2986,94 @@ static void eng_obj_release(void* user, u32 handle)
+     eng_collect_retired_objects();
+ }
+ 
++/* GPUs without BC (DXT) sampling -- the A15 in an Apple TV 4K -- get those
++ * textures as RGBA8, the blocks decoded on upload. s_eng_obj_bc holds a
++ * texture's BC kind (1..3) when it is stored that way. */
++static int s_eng_bc_native = -1;
++
++static int eng_bc_native(void)
++{
++    if (s_eng_bc_native < 0) {
++        s_eng_bc_native = 1;
++        if ([s_dev respondsToSelector:@selector(supportsBCTextureCompression)])
++            s_eng_bc_native = [s_dev supportsBCTextureCompression] ? 1 : 0;
++        if (!s_eng_bc_native)
++            fprintf(stderr, "[RSX metal] no BC texture support; DXT decoded to RGBA8 on upload\n");
++    }
++    return s_eng_bc_native;
++}
++
++static u8 eng_bc_kind(rsx_be_format f)
++{
++    switch (f) {
++    case RSX_BE_FMT_BC1: return 1;
++    case RSX_BE_FMT_BC2: return 2;
++    case RSX_BE_FMT_BC3: return 3;
++    default:             return 0;
++    }
++}
++
++static void bc_color_block(const u8* b, u8 out[16][4], int bc1)
++{
++    const u16 c0 = (u16)(b[0] | (b[1] << 8)), c1 = (u16)(b[2] | (b[3] << 8));
++    u8 pal[4][4];
++    pal[0][0] = (u8)(((c0 >> 11) & 31) * 255 / 31); pal[0][1] = (u8)(((c0 >> 5) & 63) * 255 / 63);
++    pal[0][2] = (u8)((c0 & 31) * 255 / 31);         pal[0][3] = 255;
++    pal[1][0] = (u8)(((c1 >> 11) & 31) * 255 / 31); pal[1][1] = (u8)(((c1 >> 5) & 63) * 255 / 63);
++    pal[1][2] = (u8)((c1 & 31) * 255 / 31);         pal[1][3] = 255;
++    if (!bc1 || c0 > c1) {
++        for (int k = 0; k < 3; k++) {
++            pal[2][k] = (u8)((2 * pal[0][k] + pal[1][k]) / 3);
++            pal[3][k] = (u8)((pal[0][k] + 2 * pal[1][k]) / 3);
++        }
++        pal[2][3] = pal[3][3] = 255;
++    } else {
++        for (int k = 0; k < 3; k++) { pal[2][k] = (u8)((pal[0][k] + pal[1][k]) / 2); pal[3][k] = 0; }
++        pal[2][3] = 255; pal[3][3] = 0;
++    }
++    const u32 idx = (u32)b[4] | ((u32)b[5] << 8) | ((u32)b[6] << 16) | ((u32)b[7] << 24);
++    for (int i = 0; i < 16; i++) memcpy(out[i], pal[(idx >> (2 * i)) & 3], 4);
++}
++
++/* One BC1/2/3 image (row_bytes per row of 4x4 blocks) into w x h RGBA8. */
++static void bc_decode(u8 kind, const u8* src, u32 row_bytes, u32 w, u32 h, u8* dst)
++{
++    const u32 bw = (w + 3) / 4, bh = (h + 3) / 4, bsz = (kind == 1) ? 8 : 16;
++    for (u32 by = 0; by < bh; by++)
++        for (u32 bx = 0; bx < bw; bx++) {
++            const u8* b = src + (size_t)by * row_bytes + (size_t)bx * bsz;
++            u8 px[16][4];
++            if (kind == 1) {
++                bc_color_block(b, px, 1);
++            } else {
++                bc_color_block(b + 8, px, 0);
++                if (kind == 2) {
++                    for (int i = 0; i < 16; i++)
++                        px[i][3] = (u8)(((b[i / 2] >> (4 * (i & 1))) & 15) * 17);
++                } else {
++                    u8 a[8]; a[0] = b[0]; a[1] = b[1];
++                    if (a[0] > a[1]) for (int k = 1; k < 7; k++) a[k + 1] = (u8)(((7 - k) * a[0] + k * a[1]) / 7);
++                    else { for (int k = 1; k < 5; k++) a[k + 1] = (u8)(((5 - k) * a[0] + k * a[1]) / 5); a[6] = 0; a[7] = 255; }
++                    u64 bits = 0;
++                    for (int k = 0; k < 6; k++) bits |= (u64)b[2 + k] << (8 * k);
++                    for (int i = 0; i < 16; i++) px[i][3] = a[(bits >> (3 * i)) & 7];
++                }
++            }
++            for (u32 y = 0; y < 4; y++) {
++                const u32 ty = by * 4 + y;
++                if (ty >= h) break;
++                for (u32 x = 0; x < 4; x++) {
++                    const u32 tx = bx * 4 + x;
++                    if (tx >= w) break;
++                    memcpy(dst + ((size_t)ty * w + tx) * 4, px[y * 4 + x], 4);
++                }
++            }
++        }
++}
++
+ static MTLPixelFormat eng_pixel_format(rsx_be_format f)
+ {
++    if (eng_bc_kind(f) && !eng_bc_native()) return MTLPixelFormatRGBA8Unorm;
+     switch (f) {
+     case RSX_BE_FMT_R8:              return MTLPixelFormatR8Unorm;
+     case RSX_BE_FMT_R8G8:            return MTLPixelFormatRG8Unorm;
+@@ -3031,6 +3237,8 @@ static void eng_shutdown(void* user)
+     s_eng_linear_sampler = nil;
+     s_eng_fxaa_pso = nil;
+     s_eng_fxaa_tex = nil;
++    if (@available(macOS 13.0, iOS 16.0, *)) s_eng_mfx = nil;
++    s_eng_mfx_tex = nil;
+     s_eng_active = 0;
+     s_eng_encoding_failed = 0;
+     s_eng_checked_completed = 0;
+@@ -3066,7 +3274,23 @@ static u32 eng_texture_create(void* user, rsx_be_format fmt, u32 w, u32 h,
+     td.swizzle = MTLTextureSwizzleChannelsMake(
+         swizzle_sel(sel[1]), swizzle_sel(sel[2]),
+         swizzle_sel(sel[3]), swizzle_sel(sel[0]));
+-    return eng_obj_add([s_dev newTextureWithDescriptor:td]);
++    const u32 h_ = eng_obj_add([s_dev newTextureWithDescriptor:td]);
++    if (h_) s_eng_obj_bc[h_ - 1] = eng_bc_native() ? 0 : eng_bc_kind(fmt);
++    return h_;
++}
++
++/* A BC texture stored as RGBA8: decode the blocks first. */
++static const void* eng_bc_unpack(u32 handle, const void* src, u32* row_bytes, u32 w, u32 h)
++{
++    static u8* buf; static size_t cap;
++    const u8 kind = s_eng_obj_bc[handle - 1];
++    if (!kind) return src;
++    const size_t need = (size_t)w * h * 4;
++    if (need > cap) { free(buf); buf = (u8*)malloc(need); cap = buf ? need : 0; }
++    if (!buf) return NULL;
++    bc_decode(kind, (const u8*)src, *row_bytes, w, h, buf);
++    *row_bytes = w * 4;
++    return buf;
+ }
+ 
+ static void eng_texture_upload(void* user, u32 handle, u32 face, u32 mip,
+@@ -3076,6 +3300,7 @@ static void eng_texture_upload(void* user, u32 handle, u32 face, u32 mip,
+     (void)user; (void)rows;
+     id<MTLTexture> t = eng_obj(handle);
+     if (!t || !src || !row_bytes) return;
++    if (!(src = eng_bc_unpack(handle, src, &row_bytes, w, h))) return;
+     [t replaceRegion:MTLRegionMake2D(0, 0, w, h)
+          mipmapLevel:mip
+                slice:face
+@@ -3104,7 +3329,9 @@ static u32 eng_texture_create_3d(void* user, rsx_be_format fmt, u32 w, u32 h,
+     td.swizzle = MTLTextureSwizzleChannelsMake(
+         swizzle_sel(sel[1]), swizzle_sel(sel[2]),
+         swizzle_sel(sel[3]), swizzle_sel(sel[0]));
+-    return eng_obj_add([s_dev newTextureWithDescriptor:td]);
++    const u32 h_ = eng_obj_add([s_dev newTextureWithDescriptor:td]);
++    if (h_) s_eng_obj_bc[h_ - 1] = eng_bc_native() ? 0 : eng_bc_kind(fmt);
++    return h_;
+ }
+ 
+ static void eng_texture_upload_3d(void* user, u32 handle, u32 z, u32 mip,
+@@ -3113,6 +3340,7 @@ static void eng_texture_upload_3d(void* user, u32 handle, u32 z, u32 mip,
+     (void)user;
+     id<MTLTexture> t = eng_obj(handle);
+     if (!t || !src || !row_bytes) return;
++    if (!(src = eng_bc_unpack(handle, src, &row_bytes, w, h))) return;
+     [t replaceRegion:MTLRegionMake3D(0, 0, z, w, h, 1)
+          mipmapLevel:mip
+                slice:0
+@@ -3294,30 +3522,186 @@ static u32 eng_depth_as_color(void* user, u32 depth, u32 w, u32 h, u32 rsx_fmt)
+ 
+ /* ---- pipelines ----------------------------------------------------------- */
+ 
++/* Translated shaders are kept on disk, one MSL file per guest program
++ * (<vp|fp>_<hash of its HLSL>.msl): translating a program the first time a
++ * draw needs it (glslang, SPIR-V, spirv-cross) and compiling it held that
++ * frame up, which on an A15 is a visible hitch for every new effect.
++ *   PS3_SHADER_CACHE=<dir>     read and written
++ *   PS3_SHADER_CACHE_RO=<dir>  read only (an app's bundled cache); its
++ *                              programs are also compiled ahead, in the
++ *                              background, when the engine starts.
++ * spirv-cross is run with the same options on every host, so a cache made on
++ * a Mac serves an iPad or an Apple TV. */
++static pthread_mutex_t s_eng_func_lock = PTHREAD_MUTEX_INITIALIZER;
++
++static char* shader_cache_load(const char* what, u64 hash)
++{
++    const char* dirs[2] = { getenv("PS3_SHADER_CACHE_RO"), getenv("PS3_SHADER_CACHE") };
++    for (int d = 0; d < 2; d++) {
++        if (!dirs[d] || !*dirs[d]) continue;
++        char path[1024];
++        snprintf(path, sizeof path, "%s/%s_%016llx.msl", dirs[d], what, (unsigned long long)hash);
++        FILE* f = fopen(path, "rb");
++        if (!f) continue;
++        fseek(f, 0, SEEK_END); const long n = ftell(f); fseek(f, 0, SEEK_SET);
++        char* buf = (n > 0) ? (char*)malloc((size_t)n + 1) : NULL;
++        if (buf && fread(buf, 1, (size_t)n, f) == (size_t)n) { buf[n] = 0; fclose(f); return buf; }
++        free(buf); fclose(f);
++    }
++    return NULL;
++}
++
++static void shader_cache_store(const char* what, u64 hash, const char* msl)
++{
++    const char* dir = getenv("PS3_SHADER_CACHE");
++    if (!dir || !*dir) return;
++    char path[1024], tmp[1040];
++    snprintf(path, sizeof path, "%s/%s_%016llx.msl", dir, what, (unsigned long long)hash);
++    snprintf(tmp, sizeof tmp, "%s.tmp", path);
++    FILE* f = fopen(tmp, "wb");
++    if (!f) return;
++    const size_t n = strlen(msl);
++    const int ok = fwrite(msl, 1, n, f) == n;
++    fclose(f);
++    if (ok) rename(tmp, path); else remove(tmp);
++}
++
++static id<MTLFunction> eng_func_lookup(u64 hash, int* found)
++{
++    id<MTLFunction> fn = nil; *found = 0;
++    pthread_mutex_lock(&s_eng_func_lock);
++    for (u32 i = 0; i < s_eng_func_count; i++)
++        if (s_eng_func[i].hash == hash) { fn = s_eng_func[i].fn; *found = 1; break; }
++    pthread_mutex_unlock(&s_eng_func_lock);
++    return fn;
++}
++
++static void eng_func_insert(u64 hash, id<MTLFunction> fn)
++{
++    pthread_mutex_lock(&s_eng_func_lock);
++    for (u32 i = 0; i < s_eng_func_count; i++)
++        if (s_eng_func[i].hash == hash) { pthread_mutex_unlock(&s_eng_func_lock); return; }
++    if (s_eng_func_count < ENG_MAX_FUNCS) {
++        s_eng_func[s_eng_func_count].hash = hash;
++        s_eng_func[s_eng_func_count].fn   = fn;
++        s_eng_func_count++;
++    }
++    pthread_mutex_unlock(&s_eng_func_lock);
++}
++
++/* Compile the read-only cache's programs ahead of their first draw. */
++static void eng_shader_prewarm(void)
++{
++    const char* ro = getenv("PS3_SHADER_CACHE_RO");
++    if (!ro || !*ro || !s_guest_shaders) return;
++    NSString* dir = [NSString stringWithUTF8String:ro];
++    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
++        const uint64_t t0 = diag_now_ns();
++        unsigned n = 0;
++        for (NSString* f in [NSFileManager.defaultManager contentsOfDirectoryAtPath:dir error:nil]) {
++            char what[4]; unsigned long long hash;
++            if (sscanf(f.UTF8String, "%2[vpf]_%16llx.msl", what, &hash) != 2) continue;
++            int found; eng_func_lookup((u64)hash, &found);
++            if (found) continue;
++            char* msl = shader_cache_load(what, (u64)hash);
++            if (!msl) continue;
++            char name[64];
++            snprintf(name, sizeof name, "%s %016llx", what, hash);
++            id<MTLFunction> fn = compile_guest_function(msl, name);
++            free(msl);
++            if (fn) { eng_func_insert((u64)hash, fn); n++; }
++        }
++        fprintf(stderr, "[RSX metal] shader cache: %u programs compiled ahead in %.0f ms\n",
++                n, (diag_now_ns() - t0) / 1e6);
++    });
++}
++
++/* Built pipelines are kept in a Metal binary archive beside the shader cache
++ * (PS3_SHADER_CACHE/pipelines.binarchive): creating one compiles the shaders
++ * for the GPU, which at the start of a level cost an iPad 80 ms in one go;
++ * from the archive the next run only loads them. New pipelines are added and
++ * the archive written on a background queue, a couple of seconds after the
++ * last one, so the first run does not pay twice. */
++static id<MTLBinaryArchive> s_eng_archive;
++static dispatch_queue_t     s_eng_archive_q;
++static NSURL*               s_eng_archive_url;
++static unsigned             s_eng_archive_dirty;
++
++static void eng_archive_open(void)
++{
++    static int tried;
++    if (tried) return;
++    tried = 1;
++    const char* dir = getenv("PS3_SHADER_CACHE");
++    if (!dir || !*dir) return;
++    s_eng_archive_url = [NSURL fileURLWithPath:
++        [[NSString stringWithUTF8String:dir] stringByAppendingPathComponent:@"pipelines.binarchive"]];
++    MTLBinaryArchiveDescriptor* d = [MTLBinaryArchiveDescriptor new];
++    if ([NSFileManager.defaultManager fileExistsAtPath:s_eng_archive_url.path]) d.url = s_eng_archive_url;
++    NSError* err = nil;
++    s_eng_archive = [s_dev newBinaryArchiveWithDescriptor:d error:&err];
++    if (!s_eng_archive && d.url) {           /* unreadable (another GPU, a new OS): start over */
++        d.url = nil;
++        s_eng_archive = [s_dev newBinaryArchiveWithDescriptor:d error:&err];
++    }
++    s_eng_archive_q = dispatch_queue_create("rsx.pipeline-archive", DISPATCH_QUEUE_SERIAL);
++    fprintf(stderr, "[RSX metal] pipeline archive %s\n",
++            s_eng_archive ? (d.url ? "loaded" : "new") : "unavailable");
++}
++
++static void eng_archive_add(MTLRenderPipelineDescriptor* pd)
++{
++    if (!s_eng_archive) return;
++    MTLRenderPipelineDescriptor* copy = [pd copy];
++    const unsigned gen = ++s_eng_archive_dirty;
++    dispatch_async(s_eng_archive_q, ^{
++        NSError* err = nil;
++        [s_eng_archive addRenderPipelineFunctionsWithDescriptor:copy error:&err];
++    });
++    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC), s_eng_archive_q, ^{
++        if (gen != s_eng_archive_dirty) return;       /* more came since: a later write */
++        NSError* err = nil;
++        if (![s_eng_archive serializeToURL:s_eng_archive_url error:&err])
++            fprintf(stderr, "[RSX metal] pipeline archive write failed: %s\n",
++                    [[err localizedDescription] UTF8String]);
++    });
++}
++
+ static id<MTLFunction> eng_function(const char* hlsl, int stage,
+                                     const char* what)
+ {
+     const u64 hash = fnv1a64(hlsl, (u32)strlen(hlsl), 1469598103934665603ull);
+-    for (u32 i = 0; i < s_eng_func_count; i++)
+-        if (s_eng_func[i].hash == hash) return s_eng_func[i].fn;
+-    if (s_eng_func_count >= ENG_MAX_FUNCS) return nil;
++    int found;
++    id<MTLFunction> fn = eng_func_lookup(hash, &found);
++    if (found) return fn;
+ 
+-    id<MTLFunction> fn = nil;
++    const uint64_t t0 = diag_now_ns();
+     char name[64];
+     snprintf(name, sizeof name, "%s_%016llx.hlsl", what, (unsigned long long)hash);
+     dump_shader(name, hlsl);
+-    if (rsx_hlsl_to_msl(hlsl, stage, s_msl, sizeof s_msl, s_log, sizeof s_log) != 0) {
+-        fprintf(stderr, "[rsx engine/metal] %s %016llx: %s\n", what,
+-                (unsigned long long)hash, s_log);
+-    } else {
++    char* cached = shader_cache_load(what, hash);
++    const char* msl = cached;
++    if (!msl) {
++        if (rsx_hlsl_to_msl(hlsl, stage, s_msl, sizeof s_msl, s_log, sizeof s_log) != 0) {
++            fprintf(stderr, "[rsx engine/metal] %s %016llx: %s\n", what,
++                    (unsigned long long)hash, s_log);
++        } else {
++            msl = s_msl;
++            shader_cache_store(what, hash, s_msl);
++        }
++    }
++    const uint64_t t1 = diag_now_ns();
++    if (msl) {
+         snprintf(name, sizeof name, "%s_%016llx.msl", what, (unsigned long long)hash);
+-        dump_shader(name, s_msl);
++        dump_shader(name, msl);
+         snprintf(name, sizeof name, "%s %016llx", what, (unsigned long long)hash);
+-        fn = compile_guest_function(s_msl, name);
++        fn = compile_guest_function(msl, name);
+     }
+-    s_eng_func[s_eng_func_count].hash = hash;
+-    s_eng_func[s_eng_func_count].fn   = fn;
+-    s_eng_func_count++;
++    free(cached);
++    atomic_fetch_add(&s_diag_shaders, 1);
++    atomic_fetch_add(&s_diag_xlate_ns, t1 - t0);
++    atomic_fetch_add(&s_diag_compile_ns, diag_now_ns() - t1);
++    eng_func_insert(hash, fn);
+     return fn;
+ }
+ 
+@@ -3409,8 +3793,14 @@ static u32 eng_pipeline_create(void* user, const char* vs_hlsl, const char* ps_h
+     }
+ 
+     NSError* err = nil;
++    eng_archive_open();
++    if (s_eng_archive) pd.binaryArchives = @[s_eng_archive];
++    const uint64_t pso_t0 = diag_now_ns();
+     id<MTLRenderPipelineState> pso =
+         [s_dev newRenderPipelineStateWithDescriptor:pd error:&err];
++    if (pso) eng_archive_add(pd);
++    atomic_fetch_add(&s_diag_psos, 1);
++    atomic_fetch_add(&s_diag_pso_ns, diag_now_ns() - pso_t0);
+     if (!pso) {
+         fprintf(stderr, "[rsx engine/metal] pipeline state failed: %s\n",
+                 [[err localizedDescription] UTF8String]);
+@@ -4101,7 +4491,23 @@ static void eng_encode_records(id<MTLCommandBuffer> cb, id<MTLBuffer> stage)
+                 rp.colorAttachments[k].loadAction = MTLLoadActionLoad;
+             }
+         }
+-        if (zbuf) {
++        if (zbuf == s_depth && !depth) {
++            /* The guest set no zeta: s_depth is only there because a pipeline
++             * always declares a depth attachment. It holds nothing the title
++             * can see, so it is neither read in nor written back. On a tiled
++             * GPU loading and storing it cost a full 1280x720 depth/stencil
++             * round trip through memory per pass -- 60 passes a frame in a
++             * Digger HD level, more than an A15 has the bandwidth for. */
++            rp.depthAttachment.texture        = zbuf;
++            rp.depthAttachment.loadAction     = MTLLoadActionClear;
++            rp.depthAttachment.storeAction    = MTLStoreActionDontCare;
++            rp.depthAttachment.clearDepth     = 1.0;
++            rp.stencilAttachment.texture      = zbuf;
++            rp.stencilAttachment.loadAction   = MTLLoadActionClear;
++            rp.stencilAttachment.storeAction  = MTLStoreActionDontCare;
++            rp.stencilAttachment.clearStencil = 0;
++            atomic_fetch_add(&s_diag_nozeta, 1);
++        } else if (zbuf) {
+             const int clear_here = have_clear_ds && depth == cd;
+             rp.depthAttachment.texture       = zbuf;
+             rp.depthAttachment.storeAction   = MTLStoreActionStore;
+@@ -4133,11 +4539,18 @@ static void eng_encode_records(id<MTLCommandBuffer> cb, id<MTLBuffer> stage)
+             continue;
+         }
+         s_ft_passes++;
++        { const u32 pw = attach ? (u32)[tex[0] width] : (u32)[zbuf width];
++          const u32 ph = attach ? (u32)[tex[0] height] : (u32)[zbuf height];
++          atomic_fetch_add(&s_diag_passes, 1);
++          atomic_fetch_add(&s_diag_mpix, (uint64_t)pw * ph * (attach + 1) / 1000);
++          if (pw * ph > atomic_load(&s_diag_max_w) * atomic_load(&s_diag_max_h)) {
++              atomic_store(&s_diag_max_w, pw); atomic_store(&s_diag_max_h, ph); } }
+         while (i < s_eng_rec_count && s_eng_rec[i].kind == ENG_REC_DRAW &&
+                eng_record_targets_are(&s_eng_rec[i], rt, nrt) &&
+                (s_eng_rec[i].depth == depth ||
+                 (!s_eng_rec[i].depth && zbuf == s_depth))) {
+             eng_encode_draw(enc, &s_eng_rec[i], stage);
++            atomic_fetch_add(&s_diag_draws, 1);
+             i++;
+         }
+         [enc endEncoding];
+@@ -4197,6 +4610,55 @@ static id<MTLTexture> eng_fxaa(id<MTLCommandBuffer> cb, id<MTLTexture> src)
+  * With PS3_AA=fxaa the surface goes through FXAA first, at its own size; with
+  * PS3_SHARPEN this pass sharpens it as it samples. Either one that is off or
+  * fails is skipped. */
++/* MetalFX spatial upscale of the frame to ow x oh, the size it is shown at
++ * in the window; nil (bicubic in the present instead) when unavailable or
++ * when the textures don't meet the scaler's needs. The scaler is rebuilt when
++ * the window changes size. */
++static id<MTLTexture> eng_metalfx(id<MTLCommandBuffer> cb, id<MTLTexture> src,
++                                  NSUInteger ow, NSUInteger oh)
++{
++    if (@available(macOS 13.0, iOS 16.0, *)) {
++        const MTLPixelFormat fmt = [src pixelFormat];
++        if (!s_eng_mfx || [s_eng_mfx inputWidth] != [src width] ||
++            [s_eng_mfx inputHeight] != [src height] || [s_eng_mfx outputWidth] != ow ||
++            [s_eng_mfx outputHeight] != oh || [s_eng_mfx colorTextureFormat] != fmt) {
++            MTLFXSpatialScalerDescriptor* d = [MTLFXSpatialScalerDescriptor new];
++            d.colorTextureFormat  = fmt;
++            d.outputTextureFormat = fmt;
++            d.inputWidth  = [src width];  d.inputHeight  = [src height];
++            d.outputWidth = ow;           d.outputHeight = oh;
++            d.colorProcessingMode = MTLFXSpatialScalerColorProcessingModePerceptual;
++            s_eng_mfx = [d newSpatialScalerWithDevice:s_dev];
++            s_eng_mfx_tex = nil;
++            if (!s_eng_mfx) {
++                fprintf(stderr, "[RSX metal] MetalFX scaler %lux%lu -> %lux%lu failed; bicubic upscale\n",
++                        (unsigned long)[src width], (unsigned long)[src height],
++                        (unsigned long)ow, (unsigned long)oh);
++                s_eng_upscale = 0;
++                return nil;
++            }
++            MTLTextureDescriptor* td =
++                [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:fmt width:ow
++                                                                  height:oh mipmapped:NO];
++            td.usage       = [s_eng_mfx outputTextureUsage] | MTLTextureUsageShaderRead;
++            td.storageMode = MTLStorageModePrivate;
++            s_eng_mfx_tex = [s_dev newTextureWithDescriptor:td];
++            static int logged;
++            if (!logged++)
++                fprintf(stderr, "[RSX metal] present: MetalFX spatial upscale\n");
++        }
++        const MTLTextureUsage need = [s_eng_mfx colorTextureUsage];
++        if (!s_eng_mfx_tex || ([src usage] & need) != need) return nil;
++        s_eng_mfx.colorTexture       = src;
++        s_eng_mfx.outputTexture      = s_eng_mfx_tex;
++        s_eng_mfx.inputContentWidth  = [src width];
++        s_eng_mfx.inputContentHeight = [src height];
++        [s_eng_mfx encodeToCommandBuffer:cb];
++        return s_eng_mfx_tex;
++    }
++    return nil;
++}
++
+ static void eng_blit_to_display(id<MTLCommandBuffer> cb, id<MTLTexture> src,
+                                 id<MTLTexture> dst)
+ {
+@@ -4217,25 +4679,63 @@ static void eng_blit_to_display(id<MTLCommandBuffer> cb, id<MTLTexture> src,
+         }
+         s_eng_blit_pso_fmt = [dst pixelFormat];
+     }
+-    MTLRenderPassDescriptor* rp = [MTLRenderPassDescriptor renderPassDescriptor];
+-    rp.colorAttachments[0].texture     = dst;
+-    rp.colorAttachments[0].loadAction  = MTLLoadActionDontCare;
+-    rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+-    id<MTLRenderCommandEncoder> e = [cb renderCommandEncoderWithDescriptor:rp];
+-    if (!e) return;
+-    [e setRenderPipelineState:s_eng_blit_pso];
+-    [e setFragmentTexture:src atIndex:0];
+-    [e setFragmentSamplerState:s_eng_point_sampler atIndex:0];
++    /* The geometry is worked out before the pass: an enlarged frame goes
++     * through MetalFX first, outside any render encoder. */
+     /* The video out's gamma (cellVideoOutSetGamma, the title's brightness
+      * setting): out = in^gamma, as RPCS3's calibration pass applies it. The
+-     * sharpening taps are one source texel apart. */
++     * sharpening taps are one source texel apart.
++     *
++     * Fit the frame to the window. A window wider than the frame gets black
++     * side bars. A narrower one first loses up to PRESENT_MAX_CROP of the
++     * frame's width from each side below the top band -- the playfield's
++     * decorative rock border -- while the band (sky, HUD, grass) is narrowed
++     * to the same width instead of cut, so the lives and the level name stay
++     * whole; whatever is left over becomes black bars above and below. */
+     { extern float cellAvconfExt_display_gamma(void);
+-      const struct { float gamma, sharp, px[2]; } p = {
++      enum { PRESENT_BAND_720 = 100 };          /* top band height at 720 lines */
++      const float PRESENT_MAX_CROP = 0.0625f;   /* per side: the band narrows by up to 12.5% */
++      const float sw = (float)[src width], sh = (float)[src height];
++      const float dw = (float)[dst width], dh = (float)[dst height];
++      const float sa = sw / sh, da = dw / dh;
++      float crop = 0.0f, rx, ry, rw, rh;
++      if (da >= sa) { rh = dh; rw = dh * sa; }
++      else {
++          crop = (1.0f - da / sa) * 0.5f;
++          if (crop > PRESENT_MAX_CROP) crop = PRESENT_MAX_CROP;
++          const float ca = sa * (1.0f - 2.0f * crop);
++          if (da >= ca) { rh = dh; rw = dh * ca; } else { rw = dw; rh = dw / ca; }
++      }
++      rx = (dw - rw) * 0.5f; ry = (dh - rh) * 0.5f;
++      /* Shown at its own size, uncut: the texels themselves, no filter. */
++      float mode = (crop == 0.0f && fabsf(rw - sw) < 0.5f && fabsf(rh - sh) < 0.5f) ? 1.0f : 0.0f;
++      /* Enlarged: MetalFX scales the whole frame by the playfield's factor
++       * (rh / sh; the crop keeps the aspect, so it is the same across), on
++       * whole pixels, and the pass below then maps it close to 1:1. */
++      id<MTLTexture> img = src;
++      if (mode == 0.0f && s_eng_upscale > 0 && rh > sh + 0.5f) {
++          rh = floorf(rh + 0.5f); rw = floorf(rw + 0.5f);
++          rx = floorf((dw - rw) * 0.5f); ry = floorf((dh - rh) * 0.5f);
++          const NSUInteger uh = (NSUInteger)rh, uw = (NSUInteger)floorf(sw * rh / sh + 0.5f);
++          id<MTLTexture> up = eng_metalfx(cb, src, uw, uh);
++          if (up) { img = up; mode = 2.0f; }
++      }
++      const float iw = (float)[img width], ih = (float)[img height];
++      const struct { float gamma, sharp, px[2], rect[4], crop, band, srcsz[2], mode, pad[3]; } p = {
+           cellAvconfExt_display_gamma(), s_eng_sharpen,
+-          { 1.0f / (float)[src width], 1.0f / (float)[src height] } };
+-      [e setFragmentBytes:&p length:sizeof p atIndex:0]; }
+-    [e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+-    [e endEncoding];
++          { 1.0f / iw, 1.0f / ih }, { rx, ry, rw, rh }, crop,
++          (float)PRESENT_BAND_720 / 720.0f, { iw, ih }, mode, { 0, 0, 0 } };
++      MTLRenderPassDescriptor* rp = [MTLRenderPassDescriptor renderPassDescriptor];
++      rp.colorAttachments[0].texture     = dst;
++      rp.colorAttachments[0].loadAction  = MTLLoadActionDontCare;
++      rp.colorAttachments[0].storeAction = MTLStoreActionStore;
++      id<MTLRenderCommandEncoder> e = [cb renderCommandEncoderWithDescriptor:rp];
++      if (!e) return;
++      [e setRenderPipelineState:s_eng_blit_pso];
++      [e setFragmentTexture:img atIndex:0];
++      [e setFragmentSamplerState:s_eng_linear_sampler atIndex:0];
++      [e setFragmentBytes:&p length:sizeof p atIndex:0];
++      [e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
++      [e endEncoding]; }
+ }
+ 
+ /* Encode everything recorded so far and commit it.
+@@ -4248,6 +4748,115 @@ static void eng_blit_to_display(id<MTLCommandBuffer> cb, id<MTLTexture> src,
+  * in-flight semaphore instead, the same bound the vtable path uses, because
+  * waiting on every frame is the one pattern where a driver cannot hide its
+  * encoding work. */
++/* ---- mailbox present (iOS / tvOS) -------------------------------------------
++ * The RSX thread must not wait for the display: while it sat in nextDrawable
++ * it drained nothing, the title waited on it, and on an Apple TV a third of
++ * every frame went there. So the finished frame is copied into one of three
++ * textures of our own and the RSX thread moves on; a present thread takes the
++ * newest of them, waits for a drawable and puts it on screen. A frame the
++ * display had no time for is replaced by a newer one, as a mailbox swap
++ * chain does. PS3_MAILBOX=0 presents on the RSX thread as before. */
++static id<MTLTexture>      s_mbox[3];
++static _Atomic int         s_mbox_latest = -1;    /* newest finished frame */
++static _Atomic int         s_mbox_reading = -1;   /* the one being presented */
++static dispatch_semaphore_t s_mbox_sem;
++static dispatch_semaphore_t s_mbox_free;          /* a frame went to the screen */
++static _Atomic unsigned    s_mbox_frames;         /* posted */
++static _Atomic unsigned    s_mbox_shown;          /* presented */
++
++static int eng_mailbox_on(void)
++{
++    static int on = -1;
++    if (on < 0) {
++#if TARGET_OS_IPHONE
++        const char* e = getenv("PS3_MAILBOX");
++        on = !(e && *e == '0');
++#else
++        on = 0;
++#endif
++    }
++    return on && !s_headless && !s_host && s_layer;
++}
++
++static void* eng_present_thread(void* arg)
++{
++    (void)arg;
++    pthread_setname_np("rsx-present");
++    pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
++    for (;;) {
++        dispatch_semaphore_wait(s_mbox_sem, DISPATCH_TIME_FOREVER);
++        @autoreleasepool {
++            dispatch_semaphore_wait(s_inflight, DISPATCH_TIME_FOREVER);
++            const uint64_t nd0 = diag_now_ns();
++            id<CAMetalDrawable> drawable = [s_layer nextDrawable];
++            atomic_fetch_add(&s_diag_present_cpu_wait_ns, diag_now_ns() - nd0);
++            /* Take the newest frame only now, after the wait. */
++            const int idx = atomic_load(&s_mbox_latest);
++            id<MTLTexture> src = idx >= 0 ? s_mbox[idx] : nil;
++            atomic_store(&s_mbox_reading, idx);
++            id<MTLCommandBuffer> pcb = (drawable && src) ? [s_queue commandBuffer] : nil;
++            if (!pcb) { atomic_store(&s_mbox_reading, -1); dispatch_semaphore_signal(s_inflight); continue; }
++            eng_blit_to_display(pcb, src, [drawable texture]);
++            fps_track_drawable(drawable);
++            [pcb presentDrawable:drawable];
++            dispatch_semaphore_t sem = s_inflight;
++            [pcb addCompletedHandler:^(id<MTLCommandBuffer> done) {
++                const uint64_t g = (uint64_t)(([done GPUEndTime] - [done GPUStartTime]) * 1e9);
++                atomic_fetch_add(&s_diag_gpu_ns, g);
++                atomic_fetch_add(&s_diag_present_gpu_ns, g);
++                atomic_store(&s_mbox_reading, -1);
++                dispatch_semaphore_signal(sem);
++            }];
++            [pcb commit];
++            atomic_fetch_add(&s_mbox_shown, 1);
++            dispatch_semaphore_signal(s_mbox_free);
++        }
++    }
++    return NULL;
++}
++
++/* Copy the finished frame into a free mailbox texture on cb and publish it
++ * once cb is committed. */
++static void eng_mailbox_post(id<MTLCommandBuffer> cb, id<MTLTexture> frame)
++{
++    static int started;
++    if (!started) {
++        started = 1;
++        s_mbox_sem = dispatch_semaphore_create(0);
++        s_mbox_free = dispatch_semaphore_create(0);
++        pthread_t t; pthread_create(&t, NULL, eng_present_thread, NULL); pthread_detach(t);
++    }
++    /* At most one frame ahead of the screen: the title then runs at the
++     * display's rate, as on the console, instead of drawing frames nobody
++     * sees and spending the power budget on them. The wait is bounded so a
++     * stalled display never stalls the title. */
++    for (int tries = 0; tries < 4 &&
++         atomic_load(&s_mbox_frames) - atomic_load(&s_mbox_shown) >= 2; tries++)
++        dispatch_semaphore_wait(s_mbox_free, dispatch_time(DISPATCH_TIME_NOW, 8 * NSEC_PER_MSEC));
++    const int latest = atomic_load(&s_mbox_latest), reading = atomic_load(&s_mbox_reading);
++    int w = 0;
++    while (w == latest || w == reading) w++;
++    if (!s_mbox[w] || [s_mbox[w] width] != [frame width] || [s_mbox[w] height] != [frame height] ||
++        [s_mbox[w] pixelFormat] != [frame pixelFormat]) {
++        MTLTextureDescriptor* td =
++            [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:[frame pixelFormat]
++                                                               width:[frame width]
++                                                              height:[frame height]
++                                                           mipmapped:NO];
++        td.usage = MTLTextureUsageShaderRead | MTLTextureUsageRenderTarget;
++        td.storageMode = MTLStorageModePrivate;
++        s_mbox[w] = [s_dev newTextureWithDescriptor:td];
++    }
++    id<MTLBlitCommandEncoder> b = [cb blitCommandEncoder];
++    [b copyFromTexture:frame toTexture:s_mbox[w]];
++    [b endEncoding];
++    [cb addScheduledHandler:^(id<MTLCommandBuffer> _c) {
++        atomic_store(&s_mbox_latest, w);
++        atomic_fetch_add(&s_mbox_frames, 1);
++        dispatch_semaphore_signal(s_mbox_sem);
++    }];
++}
++
+ static void eng_encode_and_commit(id<MTLTexture> present_dst)
+ {
+     s_eng_checked_completed = 0;
+@@ -4257,11 +4866,20 @@ static void eng_encode_and_commit(id<MTLTexture> present_dst)
+         int host_slot = -1;
+         const u32 host_gen = s_host_gen;
+         const int windowed_present = (present_dst && !s_headless);
++        /* To a CAMetalLayer the frame goes in two command buffers: the
++         * title's own work is encoded and committed first, and only then is
++         * the next drawable waited for, so the GPU runs the frame while the
++         * CPU waits for the display. Taking the drawable first left the RSX
++         * thread idle in nextDrawable before encoding anything -- on an
++         * Apple TV a third of each frame, added to the encoding instead of
++         * overlapping it. */
++        const int mailbox = windowed_present && eng_mailbox_on();
++        const int late_drawable = windowed_present && !s_host && !mailbox;
+         { const uint64_t w0 = PS3_FT_ON() ? ps3_ft_now() : 0;
+-          if (windowed_present) dispatch_semaphore_wait(s_inflight, DISPATCH_TIME_FOREVER);
++          if (windowed_present && !late_drawable && !mailbox) dispatch_semaphore_wait(s_inflight, DISPATCH_TIME_FOREVER);
+           if (w0 && windowed_present) { const uint64_t w1 = ps3_ft_now();
+               if (w1 - w0 >= ps3_ft_min_ns()) ps3_ft_span(PS3_FT_GPU_WAIT, 0, 2, 0, w0, w1); } }
+-        if (present_dst) {
++        if (present_dst && !late_drawable && !mailbox) {
+             if (s_headless) {
+                 dst = s_offscreen;
+             } else if (s_host) {
+@@ -4272,7 +4890,10 @@ static void eng_encode_and_commit(id<MTLTexture> present_dst)
+                 }
+                 dst = s_host_tex[host_slot];
+             } else {
+-                drawable = [s_layer nextDrawable];
++                { const uint64_t nd0 = mach_absolute_time();
++                  drawable = [s_layer nextDrawable];
++                  mach_timebase_info_data_t tb; mach_timebase_info(&tb);
++                  atomic_fetch_add(&s_diag_present_cpu_wait_ns, (mach_absolute_time() - nd0) * tb.numer / tb.denom); }
+                 if (!drawable) {           /* compositor is busy; skip */
+                     dispatch_semaphore_signal(s_inflight);
+                     return;
+@@ -4286,12 +4907,69 @@ static void eng_encode_and_commit(id<MTLTexture> present_dst)
+         if (!cb || (s_eng_stage_used && !stage)) {
+             s_eng_encoding_failed = 1;
+             host_frame_done(host_slot, host_gen, 0);
+-            if (windowed_present) dispatch_semaphore_signal(s_inflight);
++            if (windowed_present && !late_drawable && !mailbox) dispatch_semaphore_signal(s_inflight);
+             return;
+         }
+         const uint64_t ft_e0 = PS3_FT_ON() ? ps3_ft_now() : 0;
+         const u32 ft_nrec = s_eng_rec_count;
+         eng_encode_records(cb, stage);
++        if (mailbox) {
++            eng_mailbox_post(cb, present_dst);
++            [cb addCompletedHandler:^(id<MTLCommandBuffer> done) {
++                atomic_fetch_add(&s_diag_gpu_ns,
++                    (uint64_t)(([done GPUEndTime] - [done GPUStartTime]) * 1e9));
++            }];
++            eng_stage_hand_off(cb, stage);
++            [cb commit];
++            if (ft_e0) ps3_ft_span(PS3_FT_GPU_ENCODE, 0, 1u, ft_nrec, ft_e0, ps3_ft_now());
++            if (s_eng_dropped) {
++                fprintf(stderr, "[rsx engine/metal] dropped %u record(s) (cap %d)\n",
++                        s_eng_dropped, ENG_MAX_RECORDS);
++                s_eng_dropped = 0;
++            }
++            s_eng_rec_count  = 0;
++            s_eng_stage_used = 0;
++            eng_collect_retired_objects();
++            return;
++        }
++        if (late_drawable) {
++            [cb addCompletedHandler:^(id<MTLCommandBuffer> done) {
++                atomic_fetch_add(&s_diag_gpu_ns,
++                    (uint64_t)(([done GPUEndTime] - [done GPUStartTime]) * 1e9));
++            }];
++            eng_stage_hand_off(cb, stage);
++            [cb commit];
++            dispatch_semaphore_wait(s_inflight, DISPATCH_TIME_FOREVER);
++            { const uint64_t nd0 = diag_now_ns();
++              drawable = [s_layer nextDrawable];
++              atomic_fetch_add(&s_diag_present_cpu_wait_ns, diag_now_ns() - nd0); }
++            id<MTLCommandBuffer> pcb = drawable ? [s_queue commandBuffer] : nil;
++            if (!pcb) {                  /* compositor busy: this frame is not shown */
++                dispatch_semaphore_signal(s_inflight);
++            } else {
++                eng_blit_to_display(pcb, present_dst, [drawable texture]);
++                fps_track_drawable(drawable);
++                [pcb presentDrawable:drawable];
++                dispatch_semaphore_t sem = s_inflight;
++                [pcb addCompletedHandler:^(id<MTLCommandBuffer> done) {
++                    const uint64_t g = (uint64_t)(([done GPUEndTime] - [done GPUStartTime]) * 1e9);
++                    atomic_fetch_add(&s_diag_gpu_ns, g);
++                    atomic_fetch_add(&s_diag_present_gpu_ns, g);
++                    dispatch_semaphore_signal(sem);
++                }];
++                [pcb commit];
++            }
++            if (ft_e0) ps3_ft_span(PS3_FT_GPU_ENCODE, 0, 1u, ft_nrec, ft_e0, ps3_ft_now());
++            if (s_eng_dropped) {
++                fprintf(stderr, "[rsx engine/metal] dropped %u record(s) (cap %d)\n",
++                        s_eng_dropped, ENG_MAX_RECORDS);
++                s_eng_dropped = 0;
++            }
++            s_eng_rec_count  = 0;
++            s_eng_stage_used = 0;
++            eng_collect_retired_objects();
++            return;
++        }
+         if (present_dst && dst) eng_blit_to_display(cb, present_dst, dst);
+         if (drawable) { fps_track_drawable(drawable); [cb presentDrawable:drawable]; }
+         if (ft_e0) ps3_ft_span(PS3_FT_GPU_ENCODE, 0, present_dst ? 1u : 0u, ft_nrec, ft_e0, ps3_ft_now());
+@@ -4301,15 +4979,24 @@ static void eng_encode_and_commit(id<MTLTexture> present_dst)
+                 if (host_slot >= 0)
+                     host_frame_done(host_slot, host_gen,
+                                     [done status] == MTLCommandBufferStatusCompleted);
++                atomic_fetch_add(&s_diag_gpu_ns,
++                    (uint64_t)(([done GPUEndTime] - [done GPUStartTime]) * 1e9));
++                atomic_fetch_add(&s_diag_present_gpu_ns,
++                    (uint64_t)(([done GPUEndTime] - [done GPUStartTime]) * 1e9));
+                 dispatch_semaphore_signal(sem);
+             }];
+             eng_stage_hand_off(cb, stage);
+             [cb commit];
+         } else {
+             const uint64_t ft_w0 = PS3_FT_ON() ? ps3_ft_now() : 0;
++            const uint64_t dw0 = mach_absolute_time();
+             eng_stage_hand_off(cb, stage);
+             [cb commit];
+             [cb waitUntilCompleted];
++            { mach_timebase_info_data_t tb; mach_timebase_info(&tb);
++              atomic_fetch_add(&s_diag_flush_wait_ns, (mach_absolute_time() - dw0) * tb.numer / tb.denom);
++              atomic_fetch_add(&s_diag_flushes, 1);
++              atomic_fetch_add(&s_diag_gpu_ns, (uint64_t)(([cb GPUEndTime] - [cb GPUStartTime]) * 1e9)); }
+             if (ft_w0) {
+                 const uint64_t w1 = ps3_ft_now();
+                 ps3_ft_span(PS3_FT_GPU_WAIT, 0, present_dst ? 1u : 0u,
+@@ -4380,6 +5067,80 @@ static void eng_dump_frame(id<MTLTexture> src)
+     free(rgba);
+ }
+ 
++/* PAD_AUTOPLAY: twice a second, which screen the frame is -- a 64x36 grey
++ * thumbnail (PIL's bilinear downscale, as tools/playtest.py makes them)
++ * matched to the nearest reference in $PAD_AUTOPLAY_REFS -- for cellPad's
++ * autoplay to answer. */
++extern volatile int g_autoplay_screen;
++static void eng_autoplay_classify(id<MTLTexture> src)
++{
++    enum { TW = 64, TH = 36 };
++    static int on = -1; static unsigned frame;
++    static unsigned char* refs; static unsigned nref;
++    if (on < 0) {
++        on = 0;
++        const char* path = getenv("PAD_AUTOPLAY_REFS");
++        FILE* f = (getenv("PAD_AUTOPLAY") && path) ? fopen(path, "rb") : NULL;
++        if (f) {
++            char magic[4]; uint32_t n = 0;
++            if (fread(magic, 1, 4, f) == 4 && !memcmp(magic, "APRF", 4) &&
++                fread(&n, 4, 1, f) == 1 && n && n < 4096) {
++                refs = malloc((size_t)n * (1 + TW * TH));
++                if (refs && fread(refs, 1 + TW * TH, n, f) == n) { nref = n; on = 1; }
++            }
++            fclose(f);
++        }
++        if (getenv("PAD_AUTOPLAY"))
++            fprintf(stderr, "[autoplay] %u reference screens%s\n", nref, on ? "" : " -- not loaded, no autoplay");
++    }
++    if (!on || (++frame % 30) != 0) return;
++    const MTLPixelFormat pf = [src pixelFormat];
++    if (pf != MTLPixelFormatRGBA8Unorm && pf != MTLPixelFormatBGRA8Unorm) return;
++    const size_t w = [src width], h = [src height];
++    if (w < TW || h < TH || w > 8192 || h > 8192) return;
++    static unsigned char* px; static size_t cap;
++    if (w * h * 4 > cap) { free(px); px = malloc(w * h * 4); cap = px ? w * h * 4 : 0; }
++    if (!px) return;
++    if (!s_headless) {
++        id<MTLCommandBuffer> fence = [s_queue commandBuffer];
++        [fence commit];
++        [fence waitUntilCompleted];
++    }
++    [src getBytes:px bytesPerRow:w * 4 fromRegion:MTLRegionMake2D(0, 0, w, h) mipmapLevel:0];
++    const int bgra = pf == MTLPixelFormatBGRA8Unorm;
++    /* PIL's bilinear reduction: a triangle filter as wide as the scale. */
++    const double sx = (double)w / TW, sy = (double)h / TH;
++    unsigned char th[TW * TH];
++    for (int ty = 0; ty < TH; ty++)
++        for (int tx = 0; tx < TW; tx++) {
++            const double cx = (tx + 0.5) * sx, cy = (ty + 0.5) * sy;
++            double acc = 0, wsum = 0;
++            for (int y = (int)(cy - sy); y <= (int)(cy + sy); y += 2) {
++                if (y < 0 || y >= (int)h) continue;
++                const double wy = 1.0 - fabs((y + 0.5 - cy) / sy);
++                if (wy <= 0) continue;
++                for (int x = (int)(cx - sx); x <= (int)(cx + sx); x += 2) {
++                    if (x < 0 || x >= (int)w) continue;
++                    const double wx = 1.0 - fabs((x + 0.5 - cx) / sx);
++                    if (wx <= 0) continue;
++                    const unsigned char* p = px + ((size_t)y * w + x) * 4;
++                    const double r = p[bgra ? 2 : 0], g = p[1], b = p[bgra ? 0 : 2];
++                    acc += (0.299 * r + 0.587 * g + 0.114 * b) * wx * wy;
++                    wsum += wx * wy;
++                }
++            }
++            th[ty * TW + tx] = (unsigned char)(wsum > 0 ? acc / wsum + 0.5 : 0);
++        }
++    unsigned best = 0; double best_d = 1e18;
++    for (unsigned i = 0; i < nref; i++) {
++        const unsigned char* rf = refs + (size_t)i * (1 + TW * TH);
++        double d = 0;
++        for (int k = 0; k < TW * TH; k++) d += abs((int)th[k] - (int)rf[1 + k]);
++        if (d < best_d) { best_d = d; best = i; }
++    }
++    g_autoplay_screen = refs[(size_t)best * (1 + TW * TH)];
++}
++
+ static void eng_present(void* user, u32 surface)
+ {
+     (void)user;
+@@ -4390,6 +5151,7 @@ static void eng_present(void* user, u32 surface)
+     if (!src) { eng_encode_and_commit(nil); return; }
+     eng_encode_and_commit(src);
+     eng_dump_frame(src);
++    eng_autoplay_classify(src);
+ }
+ 
+ static void eng_readback(void* user, u32 surface, u32 x, u32 y, u32 w, u32 h,
+@@ -4526,8 +5288,29 @@ int rsx_metal_backend_init(u32 width, u32 height, const char* title)
+ 
+         int rc;
+ #if TARGET_OS_IPHONE
+-        s_headless = 1;
+-        rc = create_offscreen();
++        if (s_ios_layer && !s_headless) {
++            s_layer = s_ios_layer;
++            s_layer.device          = s_dev;
++            s_layer.pixelFormat     = MTLPixelFormatBGRA8Unorm;
++            s_layer.framebufferOnly = YES;
++            /* Opaque, with no background of its own: the system can show the
++             * drawable as it is instead of blending it over something, which
++             * at a 4K TV's size is a full-screen pass every frame. */
++            if (!getenv("PS3_LAYER_BLEND")) {        /* diagnostic: the old way */
++                s_layer.opaque = YES;
++                s_layer.backgroundColor = NULL;
++            }
++            if (!getenv("PS3_NO_COLORSPACE")) {     /* diagnostic */
++              CGColorSpaceRef cs = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
++              s_layer.colorspace = cs;
++              CGColorSpaceRelease(cs); }
++            rc = 0;
++            /* PS3RECOMP_METAL_FPS=1: the rates go to the log only. */
++            dispatch_async(dispatch_get_main_queue(), ^{ fps_start(); });
++        } else {
++            s_headless = 1;
++            rc = create_offscreen();
++        }
+ #else
+         /* Under a launcher (tools/host_window) the window is the launcher's.
+          * Without an answer from it the run is not lost: it opens a window of
+@@ -4595,6 +5378,7 @@ int rsx_metal_backend_init(u32 width, u32 height, const char* title)
+         if (rsx_draw_engine_enabled() &&
+             rsx_draw_engine_init(s_width, s_height) == 0) {
+             s_eng_active = 1;
++            eng_shader_prewarm();
+         } else {
+             rsx_set_backend(&s_backend_vtable);
+         }
+@@ -4682,8 +5466,38 @@ static int pump_messages_impl(void)
+                 }
+                 continue;
+             }
++            /* Keys for the pad's keyboard fallback (cellPad.c). They are
++             * kept, not forwarded: no responder in this window takes key
++             * input, so AppKit would answer each one with the alert beep.
++             * Command combinations still go to AppKit. */
++            if (([ev type] == NSEventTypeKeyDown || [ev type] == NSEventTypeKeyUp) &&
++                !([ev modifierFlags] & NSEventModifierFlagCommand)) {
++                extern _Atomic unsigned char g_host_key_down[128];
++                atomic_store(&g_host_key_down[[ev keyCode] & 127u],
++                             [ev type] == NSEventTypeKeyDown ? 1 : 0);
++                continue;
++            }
+             [NSApp sendEvent:ev];
+         }
++        /* Keep the drawable at the window's real pixel size, so the present
++         * pass does the scaling (fit, crop, Catmull-Rom) instead of the
++         * compositor stretching a 1280x720 drawable. */
++        if (s_layer && s_window) {
++            const CGFloat sc = [s_window backingScaleFactor];
++            const NSSize b = [[s_window contentView] bounds].size;
++            const CGSize want = CGSizeMake(floor(b.width * sc), floor(b.height * sc));
++            if (want.width >= 16 && want.height >= 16 &&
++                !CGSizeEqualToSize(s_layer.drawableSize, want)) {
++                s_layer.contentsScale = sc;
++                s_layer.drawableSize = want;
++            }
++        }
++        /* Release every key when the game stops being the active app, or a
++         * key held while switching away would stay down. */
++        if (![NSApp isActive]) {
++            extern _Atomic unsigned char g_host_key_down[128];
++            for (unsigned k = 0; k < 128; k++) atomic_store(&g_host_key_down[k], 0);
++        }
+     }
+ #endif
+     return atomic_load(&s_closed) ? -1 : 0;

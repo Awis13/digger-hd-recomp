@@ -1,0 +1,23 @@
+diff --git a/runtime/platform/win32_compat.c b/runtime/platform/win32_compat.c
+index 11a74804..36989e3a 100644
+--- a/runtime/platform/win32_compat.c
++++ b/runtime/platform/win32_compat.c
+@@ -49,7 +49,17 @@
+  * while all that is wanted here is the ucontext_t a signal handler is given. */
+ #  include <sys/ucontext.h>
+ #  include <mach/mach.h>
+-#  include <mach/mach_vm.h>
++#  include <TargetConditionals.h>
++#  if TARGET_OS_IPHONE
++/* The iOS SDK refuses <mach/mach_vm.h>, but the call is in libsystem_kernel
++ * there as on macOS. */
++#    include <mach/mach.h>
++extern kern_return_t mach_vm_region(vm_map_read_t, mach_vm_address_t*, mach_vm_size_t*,
++                                    vm_region_flavor_t, vm_region_info_t,
++                                    mach_msg_type_number_t*, mach_port_t*);
++#  else
++#    include <mach/mach_vm.h>
++#  endif
+ #  include <mach/thread_act.h>
+ #  include <pthread/qos.h>
+ #else

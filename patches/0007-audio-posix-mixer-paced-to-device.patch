@@ -1,0 +1,135 @@
+diff --git a/libs/audio/cellAudio.c b/libs/audio/cellAudio.c
+index 02b751b2..8ff0547d 100644
+--- a/libs/audio/cellAudio.c
++++ b/libs/audio/cellAudio.c
+@@ -98,6 +98,9 @@ extern uint32_t sys_event_queue_create_direct(uint64_t key, int32_t size);
+   #define mutex_unlock(m)  LeaveCriticalSection(m)
+ #else
+   #include <pthread.h>
++  #if defined(__APPLE__)
++  #include <pthread/qos.h>
++  #endif
+   #include <unistd.h>
+   #include <time.h>
+   typedef pthread_t thread_t;
+@@ -190,6 +193,9 @@ static int audio_backend_init(void)
+     }
+ 
+     SDL_PauseAudioDevice(s_sdl_audio_dev, 0); /* Start playback */
++    printf("[cellAudio] SDL output: driver %s, %d Hz, %d ch, format 0x%04X, %d-sample buffer\n",
++           SDL_GetCurrentAudioDriver() ? SDL_GetCurrentAudioDriver() : "?",
++           have.freq, have.channels, (unsigned)have.format, have.samples);
+     return 0;
+ }
+ 
+@@ -209,12 +215,18 @@ static void audio_backend_submit(const float* stereo_samples, u32 num_samples)
+     }
+ }
+ 
+-/* SDL queues without bound: keep about four blocks ahead of the device. */
++/* SDL queues without bound: keep a few blocks ahead of the device.
++ * PS3_AUDIO_QUEUE_BLOCKS sets how many (default 8, about 43 ms). Four left
++ * only 21 ms for a mixing thread that shares the CPU with a title's spinning
++ * SPU and PPU threads, and a late wake-up reached the speakers as a gap. */
+ static int audio_backend_room(void)
+ {
+     if (!s_sdl_audio_dev) return -1;
++    static u32 blocks = 0;
++    if (!blocks) { const char* e = getenv("PS3_AUDIO_QUEUE_BLOCKS");
++                   blocks = e && atoi(e) > 0 ? (u32)atoi(e) : 8u; }
+     return SDL_GetQueuedAudioSize(s_sdl_audio_dev) / (2 * sizeof(float)) <
+-           CELL_AUDIO_BLOCK_SAMPLES * 4 ? CELL_AUDIO_BLOCK_SAMPLES : 0;
++           CELL_AUDIO_BLOCK_SAMPLES * blocks ? CELL_AUDIO_BLOCK_SAMPLES : 0;
+ }
+ 
+ static void audio_backend_wait(void) { SDL_Delay(1); }
+@@ -649,23 +661,82 @@ static unsigned __stdcall audio_mix_thread_func(void* arg)
+     return 0;
+ }
+ #else
++static unsigned long long audio_mono_ns(void)
++{
++    struct timespec ts;
++    clock_gettime(CLOCK_MONOTONIC, &ts);
++    return (unsigned long long)ts.tv_sec * 1000000000ull + (unsigned long long)ts.tv_nsec;
++}
++
+ static void* audio_mix_thread_func(void* arg)
+ {
+     (void)arg;
+     printf("[cellAudio] Mixing thread started\n");
++#if defined(__APPLE__)
++    /* The device deadline is a few milliseconds away and the guest's threads
++     * keep every core busy: run ahead of them, as the Windows thread does
++     * with THREAD_PRIORITY_TIME_CRITICAL. */
++    pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
++#endif
++
++    /* Pace to the device clock, as the Windows thread does. The PS3 consumes
++     * one block every 5.33 ms; mixing on a fixed 2-5 ms sleep instead ran
++     * ahead of it (about 200 blocks/s), so SDL's unbounded queue grew without
++     * limit and the read index ran past the guest's writes: Digger HD's
++     * MultiStream left gaps and its music came out broken. Mix only while
++     * the device holds fewer than four blocks; with no device, pace on the
++     * monotonic clock. */
++    const unsigned long long t0 = audio_mono_ns();
++    unsigned long long base = t0, blocks = 0;
++    unsigned long long rate_t0 = t0, rate_n = 0, rate_silent = 0, rate_starved = 0;
++    FILE* wav = NULL;
++    { const char* e = getenv("AUDIO_WAV"); if (e && *e) wav = fopen(e, "wb"); }
++    const int peak_on = getenv("AUDIO_PEAK") != NULL;
++    const int rate_on = getenv("AUDIO_RATE") != NULL;
+ 
+     while (s_mix_thread_running) {
++        const int room = audio_backend_room();
++        if (room >= 0 && room < CELL_AUDIO_BLOCK_SAMPLES) { audio_backend_wait(); continue; }
++        if (room < 0) {
++            const unsigned long long now = audio_mono_ns();
++            const unsigned long long due = base +
++                blocks * CELL_AUDIO_BLOCK_SAMPLES * 1000000000ull / CELL_AUDIO_SAMPLE_RATE;
++            if (now < due) { usleep(1000); continue; }
++            /* More than 50 ms behind: drop the backlog, do not burst it. */
++            if (now - due > 50000000ull)
++                base = now - blocks * CELL_AUDIO_BLOCK_SAMPLES * 1000000000ull / CELL_AUDIO_SAMPLE_RATE;
++        }
++        blocks++;
+         audio_mix_one_block();
+-        audio_backend_submit(s_mix_buffer, CELL_AUDIO_BLOCK_SAMPLES);
+-        audio_notify_event_queues();
+ 
+-        u32 queued = audio_backend_queued_samples();
+-        if (queued > CELL_AUDIO_BLOCK_SAMPLES * 4) {
+-            usleep(5000);
+-        } else {
+-            usleep(2000);
++        /* AUDIO_PEAK / AUDIO_WAV / AUDIO_RATE: the Windows thread's probes. */
++        if (peak_on || rate_on) {
++            float pk = 0.0f;
++            for (u32 i = 0; i < CELL_AUDIO_BLOCK_SAMPLES * 2; i++) {
++                float a = s_mix_buffer[i]; if (a < 0) a = -a; if (a > pk) pk = a;
++            }
++            if (peak_on && (blocks % 200 == 0 || (pk > 0.001f && blocks < 40)))
++                fprintf(stderr, "[audio-peak] block#%llu peak=%.4f\n", blocks, pk);
++            rate_n++;
++            if (pk == 0.0f) rate_silent++;
++            const unsigned long long now = audio_mono_ns();
++            if (rate_on && now - rate_t0 >= 5000000000ull) {
++                fprintf(stderr, "[audio-rate] %.1f blocks/s (real time 187.5), silent %.1f%%, device starved %llu times\n",
++                        rate_n * 1e9 / (double)(now - rate_t0),
++                        rate_n ? 100.0 * rate_silent / rate_n : 0.0, rate_starved);
++                rate_t0 = now; rate_n = rate_silent = rate_starved = 0;
++            }
+         }
++        if (wav) fwrite(s_mix_buffer, sizeof(float), CELL_AUDIO_BLOCK_SAMPLES * 2, wav);
++
++        /* AUDIO_RATE: count submits that find the device queue empty -- the
++         * device then played silence between blocks (a click the mix itself
++         * never contains), so this is what the AUDIO_WAV capture cannot show. */
++        if (rate_on && room >= 0 && audio_backend_queued_samples() == 0) rate_starved++;
++        audio_backend_submit(s_mix_buffer, CELL_AUDIO_BLOCK_SAMPLES);
++        audio_notify_event_queues();
+     }
++    if (wav) fclose(wav);
+ 
+     printf("[cellAudio] Mixing thread stopped\n");
+     return NULL;

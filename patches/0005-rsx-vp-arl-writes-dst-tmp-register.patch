@@ -1,0 +1,26 @@
+diff --git a/libs/video/rsx_vp_decompiler.c b/libs/video/rsx_vp_decompiler.c
+index ba6c18eb..c1511289 100644
+--- a/libs/video/rsx_vp_decompiler.c
++++ b/libs/video/rsx_vp_decompiler.c
+@@ -453,12 +453,19 @@ static int rsx_vp_decompile_impl(
+                 break;
+             }
+             case 0x0D: /* ARL: address register load, rounds down */
+-                if (vmx|vmy|vmz|vmw) {
++                /* The address register written is named by the temp
++                 * destination field, as RPCS3's GetDST does ("a" + dst_tmp);
++                 * addr_reg_sel picks the register an INDEXED constant read
++                 * uses. Taking addr_reg_sel here loaded every ARL into a0:
++                 * Digger HD loads its material colour indices into a1 and
++                 * reads c[128 + a1.x] / c[128 + a1.y] as COL0/COL1, so a1
++                 * stayed 0 and every enemy took slot 128's white. */
++                if ((vmx|vmy|vmz|vmw) && dst_tmp <= 1) {
+                     char m[6]; mask_str(vmx,vmy,vmz,vmw,m);
+                     char line[256];
+                     snprintf(line,sizeof line,
+                         "    { int4 _a = (int4)floor(%s); a%u.%s = _a.%s; }\n",
+-                        A, addr_sel, m, m);
++                        A, dst_tmp, m, m);
+                     emit(&b, line);
+                 }
+                 handled = 0;

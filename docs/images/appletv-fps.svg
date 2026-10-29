@@ -1,0 +1,33 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 780 300" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif">
+  <style>
+    .bar { fill: #0969da; } .goal { stroke: #1a7f37; stroke-dasharray: 5 4; stroke-width: 1.5; }
+    .t { fill: #1f2328; font-size: 13px; } .v { fill: #1f2328; font-size: 13px; font-weight: 600; }
+    .in { fill: #ffffff; font-size: 13px; font-weight: 600; }
+    .h { fill: #1f2328; font-size: 15px; font-weight: 600; } .g { fill: #1a7f37; font-size: 12px; }
+    .n { fill: #59636e; font-size: 12px; } .ax { stroke: #d0d7de; }
+    @media (prefers-color-scheme: dark) {
+      .bar { fill: #4493f8; } .goal { stroke: #3fb950; } .g { fill: #3fb950; }
+      .t, .v, .h { fill: #e6edf3; } .n { fill: #9198a1; } .ax { stroke: #3d444d; }
+    }
+  </style>
+  <text class="h" x="10" y="22">Apple TV 4K (A15): frames per second in a level</text>
+  <line class="ax" x1="330" y1="38" x2="330" y2="236"/>
+  <line class="goal" x1="710" y1="38" x2="710" y2="236"/>
+  <text class="g" x="714" y="50">60</text>
+  <text class="t" x="320" y="59" text-anchor="end">Start: 4K output, MetalFX</text>
+  <rect class="bar" x="330" y="44" width="146" height="22" rx="3"/>
+  <text class="v" x="482" y="60">23</text>
+  <text class="t" x="320" y="99" text-anchor="end">720p drawable, vblank from the display</text>
+  <rect class="bar" x="330" y="84" width="301" height="22" rx="3"/>
+  <text class="v" x="637" y="100">47.6</text>
+  <text class="t" x="320" y="139" text-anchor="end">+ encode before waiting for the display</text>
+  <rect class="bar" x="330" y="124" width="307" height="22" rx="3"/>
+  <text class="v" x="643" y="140">48.5</text>
+  <text class="t" x="320" y="179" text-anchor="end">+ SPU threads on fast cores</text>
+  <rect class="bar" x="330" y="164" width="331" height="22" rx="3"/>
+  <text class="v" x="667" y="180">52.2</text>
+  <text class="t" x="320" y="219" text-anchor="end">+ mailbox present</text>
+  <rect class="bar" x="330" y="204" width="378" height="22" rx="3"/>
+  <text class="in" x="700" y="220" text-anchor="end">59.7</text>
+  <text class="n" x="10" y="266">Measured in a level by the on-device autoplay; averages over 1-2 minutes, 24 minutes for the last row.</text>
+</svg>

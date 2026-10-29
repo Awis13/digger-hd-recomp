@@ -1,0 +1,55 @@
+diff --git a/libs/system/cellSysutil.c b/libs/system/cellSysutil.c
+index c4eb87db..6bdbb5a1 100644
+--- a/libs/system/cellSysutil.c
++++ b/libs/system/cellSysutil.c
+@@ -509,20 +509,20 @@ s32 cellSysutilGetBgmPlaybackStatus(s32* status)
+     /* `status` is a GUEST address (YDKJ's "FMOD BGM status query thread" passes its
+      * own stack, e.g. 0xD011FF00) -- the old `*status = ...` dereferenced it as a
+      * HOST pointer and segfaulted (same bug the GetSystemParamInt comment above
+-     * describes). It is also NOT an s32 out-param: the real API fills a
+-     * CellSysutilBgmPlaybackStatus (guest, big-endian):
+-     *   +0x00 u8  playerState        +0x01 u8 reserved[7]
+-     *   +0x08 char contentId[16]     +0x18 u8 reserved2[8]
+-     *   +0x20 s32 currentFadeRatio   +0x24 u8 reserved3[4]     (0x28 bytes)
+-     */
++     * describes). It is not an s32 out-param but a CellSysutilBgmPlaybackStatus,
++     * 0x20 bytes (RPCS3 cellSysutil.h):
++     *   +0x00 u8 playerState   +0x01 u8 enableState   +0x02 char contentId[16]
++     *   +0x12 u8 currentFadeRatio (0..255)            +0x13 reserved[13]
++     * Writing 0x28 bytes overran the caller's buffer by eight. */
+     uint32_t out_ea = (uint32_t)(uintptr_t)status;
+     if (!out_ea)
+         return CELL_SYSUTIL_ERROR_VALUE;
+ 
+-    for (uint32_t o = 0; o < 0x28; o += 4)
++    for (uint32_t o = 0; o < 0x20; o += 4)
+         vm_write32(out_ea + o, 0);
+     vm_write8(out_ea + 0x00, (uint8_t)s_bgm_status);   /* playerState */
+-    vm_write32(out_ea + 0x20, 0);                      /* currentFadeRatio */
++    vm_write8(out_ea + 0x01, (uint8_t)(s_bgm_enabled ? CELL_SYSUTIL_BGMPLAYBACK_STATUS_ENABLE
++                                                     : CELL_SYSUTIL_BGMPLAYBACK_STATUS_DISABLE));
+     return CELL_OK;
+ }
+ 
+diff --git a/libs/system/cellSysutil.h b/libs/system/cellSysutil.h
+index 97a370ac..53125c60 100644
+--- a/libs/system/cellSysutil.h
++++ b/libs/system/cellSysutil.h
+@@ -89,10 +89,14 @@ extern "C" {
+ /* Maximum callback slots */
+ #define CELL_SYSUTIL_MAX_CALLBACKS  4
+ 
+-/* BGM playback */
+-#define CELL_SYSUTIL_BGMPLAYBACK_STATUS_STOP     0
+-#define CELL_SYSUTIL_BGMPLAYBACK_STATUS_PLAY     1
++/* BGM playback (SDK values, as RPCS3's cellSysutil.h has them: PLAY is 0).
++ * With STOP at 0 the status query reported the user's XMB music as playing,
++ * and a title that yields to it -- Digger HD -- muted its own music. */
++#define CELL_SYSUTIL_BGMPLAYBACK_STATUS_PLAY     0
++#define CELL_SYSUTIL_BGMPLAYBACK_STATUS_STOP     1
+ #define CELL_SYSUTIL_BGMPLAYBACK_STATUS_PAUSE    2
++#define CELL_SYSUTIL_BGMPLAYBACK_STATUS_ENABLE   0
++#define CELL_SYSUTIL_BGMPLAYBACK_STATUS_DISABLE  1
+ 
+ /* System cache path size */
+ #define CELL_SYSCACHE_PATH_MAX  1055

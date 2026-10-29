@@ -1,0 +1,19 @@
+# Upstream toolkit, pinned in README (cloned, not vendored into git)
+vendor/
+# Game files and everything derived from them: never committed
+game
+out/
+recompiled/
+spu/
+build/
+*.log
+run/
+spu-inputs/
+gamedata/
+tests/runs/
+tests/refs/
+work/
+builder/DiggerHDBuilder.xcodeproj/
+config.local.json
+__pycache__/
+.venv

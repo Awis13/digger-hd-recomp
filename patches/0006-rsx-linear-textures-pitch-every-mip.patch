@@ -1,0 +1,43 @@
+diff --git a/libs/video/rsx_texture_layout.c b/libs/video/rsx_texture_layout.c
+index 51a30a23..9a1506e3 100644
+--- a/libs/video/rsx_texture_layout.c
++++ b/libs/video/rsx_texture_layout.c
+@@ -104,6 +104,11 @@ void rsx_texture_layout_pitched(u32 rsx_fmt, u32 w, u32 h, u32 pitch,
+         out->rows      = (h + 3u) / 4u;
+         out->dst_bytes_per_texel = 0;
+         out->dst_row_bytes       = out->row_bytes;
++        /* A linear (LN) compressed image spaces its block rows by the pitch
++         * register like any linear image (RPCS3 get_subresources_layout_impl:
++         * padded_row for every !is_swizzled format, block-compressed too). */
++        if (pitch > out->row_bytes && (rsx_fmt & 0x20u))
++            out->row_bytes = pitch;
+     } else {
+         /* Swizzled unless the LN bit is set. The hardware requires power-of-two
+          * dimensions to swizzle, so a NPOT image is linear regardless. */
+@@ -135,9 +140,14 @@ u32 rsx_texture_mip_chain(u32 rsx_fmt, u32 w, u32 h, u32 levels, u32 pitch,
+     while (n < levels) {
+         rsx_tex_level* lv = &out[n];
+         lv->w = mw; lv->h = mh; lv->offset = off;
+-        /* Only level 0 has a pitch register; the rest are packed at their own
+-         * width, as the live draw engine's texture_source_span walks them. */
+-        rsx_texture_layout_pitched(rsx_fmt, mw, mh, n == 0 ? pitch : 0, &lv->tl);
++        /* A linear (LN) image keeps the pitch register's row spacing on every
++         * level; only the rows get fewer (RPCS3 get_subresources_layout_impl
++         * applies the one pitch to each mip of a !is_swizzled texture). A
++         * swizzled one has no rows: its levels are packed at their own size.
++         * Packing an LN chain left every level past 0 sheared: Digger HD's
++         * minified 1920x128 DXT1 sky strip drew as horizontal bands. */
++        const u32 lv_pitch = (n == 0 || (rsx_fmt & 0x20u)) ? pitch : 0;
++        rsx_texture_layout_pitched(rsx_fmt, mw, mh, lv_pitch, &lv->tl);
+         off += lv->tl.face_bytes;
+         n++;
+         if (mw == 1 && mh == 1) break;   /* no level below 1x1 */
+@@ -281,7 +291,7 @@ void rsx_texture_decode(void* dst, u32 dst_pitch,
+          * rather than converted -- only the row stride changes. */
+         for (u32 y = 0; y < tl->rows; y++)
+             memcpy(d + (size_t)y * dst_pitch,
+-                   src + (size_t)y * tl->row_bytes, tl->row_bytes);
++                   src + (size_t)y * tl->row_bytes, tl->dst_row_bytes);
+         return;
+     }
+ 

@@ -1,0 +1,245 @@
+diff --git a/include/ps3emu/thread_name.h b/include/ps3emu/thread_name.h
+index da9c5928..5d7af935 100644
+--- a/include/ps3emu/thread_name.h
++++ b/include/ps3emu/thread_name.h
+@@ -3,9 +3,9 @@
+  * "audio mix", ...), so a debugger, a profiler or a per-thread CPU table can
+  * tell the guest's PPU and SPU threads and the runtime's own threads apart.
+  *
+- * Windows only for now: SetThreadDescription (Windows 10 1607 and later) is
+- * looked up at run time, so older systems just skip it. Elsewhere it does
+- * nothing; pthread_setname_np needs _GNU_SOURCE on glibc before the first
++ * Windows: SetThreadDescription (Windows 10 1607 and later) is looked up at
++ * run time, so older systems just skip it. Apple: pthread_setname_np. Linux
++ * does nothing; pthread_setname_np needs _GNU_SOURCE on glibc before the first
+  * pthread.h, which a header included this late cannot promise.
+  */
+ #ifndef PS3EMU_THREAD_NAME_H
+@@ -39,8 +39,41 @@ static inline void ps3_thread_name(const char* fmt, ...)
+     w[i] = 0;
+     set_desc(GetCurrentThread(), w);
+ }
++#elif defined(__APPLE__)
++#include <pthread.h>
++/* Darwin names only the calling thread, which is exactly this contract. */
++static inline void ps3_thread_name(const char* fmt, ...)
++{
++    char s[64];
++    va_list ap;
++    va_start(ap, fmt);
++    vsnprintf(s, sizeof s, fmt, ap);
++    va_end(ap);
++    pthread_setname_np(s);
++}
+ #else
+ static inline void ps3_thread_name(const char* fmt, ...) { (void)fmt; }
+ #endif
+ 
++/* ps3_thread_hot: the calling thread runs SPU code a frame waits on. On Apple
++ * silicon the scheduler picks the core type and clock from QoS, and at the
++ * default an SPU thread is free to land on an efficiency core at a third of
++ * the speed -- on an Apple TV's A15 the frame then waits for it. Only these
++ * few threads are raised (with the guest's main thread and the RSX thread),
++ * not every thread: all of them at the top burns the energy budget.
++ * PS3_SPU_QOS=default leaves them alone. */
++#if defined(__APPLE__)
++#include <pthread/qos.h>
++#include <stdlib.h>
++#include <string.h>
++static inline void ps3_thread_hot(void)
++{
++    const char* e = getenv("PS3_SPU_QOS");
++    if (e && !strcmp(e, "default")) return;
++    pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
++}
++#else
++static inline void ps3_thread_hot(void) {}
++#endif
++
+ #endif /* PS3EMU_THREAD_NAME_H */
+diff --git a/libs/spurs/cellSpurs.c b/libs/spurs/cellSpurs.c
+index 82ea66c6..f0716aed 100644
+--- a/libs/spurs/cellSpurs.c
++++ b/libs/spurs/cellSpurs.c
+@@ -1718,6 +1718,7 @@ static DWORD WINAPI spurs_pm_worker(LPVOID p)
+ {
+     struct SpursPmSlot* slot = (struct SpursPmSlot*)p;
+     ps3_thread_name("spurs pm");
++    ps3_thread_hot();
+     struct SpursInst* si = slot->instance;
+ #ifdef _WIN32
+     { ULONG g = 256 * 1024; SetThreadStackGuarantee(&g); }
+diff --git a/libs/video/cellGcmSys.c b/libs/video/cellGcmSys.c
+index c227379c..9b2df0b0 100644
+--- a/libs/video/cellGcmSys.c
++++ b/libs/video/cellGcmSys.c
+@@ -2000,6 +2000,8 @@ void cellGcm_rsx_process_fifo(void)
+     AcquireSRWLockExclusive(&s_gcm_fifo_lock);
+     gcm_rsx_process_fifo_unlocked();
+     ReleaseSRWLockExclusive(&s_gcm_fifo_lock);
++    /* Wake a guest thread waiting in a short sleep for this (sys_timer.c). */
++    { extern void ps3_rsx_progress(void); ps3_rsx_progress(); }
+     if (ft_t0) {
+         const uint64_t t1 = ps3_ft_now();
+         if (t1 - ft_t0 >= ps3_ft_min_ns())
+diff --git a/runtime/spu/spu_raw.c b/runtime/spu/spu_raw.c
+index be77bfdc..20aa2be1 100644
+--- a/runtime/spu/spu_raw.c
++++ b/runtime/spu/spu_raw.c
+@@ -334,7 +334,13 @@ static void raw_spu_stop(raw_spu* s)
+ #ifdef _WIN32
+ static DWORD WINAPI raw_spu_thread(LPVOID arg) { raw_spu_run((raw_spu*)arg); return 0; }
+ #else
+-static void* raw_spu_thread(void* arg) { raw_spu_run((raw_spu*)arg); return NULL; }
++static void* raw_spu_thread(void* arg)
++{
++    ps3_thread_name("spu raw");
++    ps3_thread_hot();
++    raw_spu_run((raw_spu*)arg);
++    return NULL;
++}
+ #endif
+ 
+ static void raw_spu_start(raw_spu* s)
+diff --git a/runtime/spu/spu_workload.c b/runtime/spu/spu_workload.c
+index 3ce8d0d6..f4e65799 100644
+--- a/runtime/spu/spu_workload.c
++++ b/runtime/spu/spu_workload.c
+@@ -1014,7 +1014,13 @@ static DWORD WINAPI spu_async_thread(LPVOID p) {
+     return 0;
+ }
+ #else
+-static void* spu_async_thread(void* p) { spu_async_run((spu_async_job*)p); return NULL; }
++static void* spu_async_thread(void* p)
++{
++    ps3_thread_name("spu job");
++    ps3_thread_hot();
++    spu_async_run((spu_async_job*)p);
++    return NULL;
++}
+ #endif
+ 
+ int spu_workload_dispatch_job(const uint8_t* image, uint32_t image_size,
+diff --git a/runtime/syscalls/lv2_register.c b/runtime/syscalls/lv2_register.c
+index 96266731..98972cf0 100644
+--- a/runtime/syscalls/lv2_register.c
++++ b/runtime/syscalls/lv2_register.c
+@@ -718,6 +718,7 @@ static void* spu_exec_thread_proc(void* arg)
+     spu_thread_t* t = (spu_thread_t*)arg;
+     { const spu_group_t* g = spu_find_group(t->group_id);
+       ps3_thread_name("spu %s:%u", g && g->name[0] ? g->name : "group", t->index); }
++    ps3_thread_hot();
+     spu_lifted_thread_result r;
+     spu_lifted_thread_run(t->sctx, &r);
+     t->exit_status = r.exit_status;
+@@ -759,6 +760,7 @@ static void* spu_fallback_thread_proc(void* arg)
+     spu_thread_t* t = (spu_thread_t*)arg;
+     { const spu_group_t* g = spu_find_group(t->group_id);
+       ps3_thread_name("spu-hle %s:%u", g && g->name[0] ? g->name : "group", t->index); }
++    ps3_thread_hot();
+     int32_t rc = 0;
+     if (t->fb_handler) {
+         rc = t->fb_handler(t->tid, t->args_ea, t->args_size, t->fb_user);
+diff --git a/runtime/syscalls/sys_timer.c b/runtime/syscalls/sys_timer.c
+index 3a022815..f4f8ff36 100644
+--- a/runtime/syscalls/sys_timer.c
++++ b/runtime/syscalls/sys_timer.c
+@@ -129,6 +129,60 @@ static void write_be64(uint32_t addr, uint64_t val)
+     *p = val;
+ }
+ 
++/* ---------------------------------------------------------------------------
++ * RSX hand-off for short sleeps (POSIX)
++ *
++ * A title waits for the RSX in a loop of short sleeps (Digger HD: 300 and
++ * 800 us, about 2600 a second), checking a label or the ring each time, while
++ * the RSX thread drains on its own cadence. Every hand-off then cost a nap on
++ * each side, dozens of times a frame -- on an Apple TV the gap to 60 fps. So a
++ * short sleep first wakes the RSX thread (g_rsx_kick, set by the host) and
++ * then waits until the drain makes progress (ps3_rsx_progress) or the time
++ * is up, whichever comes first. The loop re-checks either way.
++ * Off unless PS3_USLEEP_HANDOFF=1: measured on an Apple TV it gained nothing
++ * once the present stopped blocking the RSX thread (mailbox present).
++ * -----------------------------------------------------------------------*/
++#ifndef _WIN32
++void (*g_rsx_kick)(void);
++static pthread_mutex_t s_prog_mu = PTHREAD_MUTEX_INITIALIZER;
++static pthread_cond_t  s_prog_cv = PTHREAD_COND_INITIALIZER;
++static unsigned long   s_prog_gen;
++static volatile int    s_prog_waiters;
++
++void ps3_rsx_progress(void)
++{
++    if (!__atomic_load_n(&s_prog_waiters, __ATOMIC_ACQUIRE)) return;
++    pthread_mutex_lock(&s_prog_mu);
++    s_prog_gen++;
++    pthread_cond_broadcast(&s_prog_cv);
++    pthread_mutex_unlock(&s_prog_mu);
++}
++
++static int usleep_handoff(uint64_t usec)
++{
++    static int on = -1;
++    if (on < 0) { const char* e = getenv("PS3_USLEEP_HANDOFF"); on = e && *e == '1'; }
++    if (!on || usec > 2000 || !g_rsx_kick) return 0;
++    struct timespec dl;
++    clock_gettime(CLOCK_REALTIME, &dl);
++    dl.tv_nsec += (long)(usec * 1000);
++    if (dl.tv_nsec >= 1000000000L) { dl.tv_sec++; dl.tv_nsec -= 1000000000L; }
++    pthread_mutex_lock(&s_prog_mu);
++    const unsigned long gen = s_prog_gen;
++    __atomic_add_fetch(&s_prog_waiters, 1, __ATOMIC_ACQ_REL);
++    pthread_mutex_unlock(&s_prog_mu);
++    g_rsx_kick();
++    pthread_mutex_lock(&s_prog_mu);
++    while (s_prog_gen == gen)
++        if (pthread_cond_timedwait(&s_prog_cv, &s_prog_mu, &dl) != 0) break;
++    __atomic_sub_fetch(&s_prog_waiters, 1, __ATOMIC_ACQ_REL);
++    pthread_mutex_unlock(&s_prog_mu);
++    return 1;
++}
++#else
++void ps3_rsx_progress(void) {}
++#endif
++
+ /* ---------------------------------------------------------------------------
+  * sys_timer_usleep
+  *
+@@ -280,7 +334,36 @@ int64_t sys_timer_usleep(ppu_context* ctx)
+         struct timespec ts;
+         ts.tv_sec  = (time_t)(usec / 1000000);
+         ts.tv_nsec = (long)((usec % 1000000) * 1000);
+-        nanosleep(&ts, NULL);
++        struct timespec t0, t1;
++        clock_gettime(CLOCK_MONOTONIC, &t0);
++        if (!usleep_handoff(usec)) nanosleep(&ts, NULL);
++        clock_gettime(CLOCK_MONOTONIC, &t1);
++        /* PS3RECOMP_METAL_FPS=1 diagnostic: what the guest asks to sleep and
++         * what it gets, every 5 s, by requested length. */
++        { static int on = -1; if (on < 0) { const char* e = getenv("PS3RECOMP_METAL_FPS"); on = e && *e == '1'; }
++          if (on) {
++            enum { B = 6 };
++            static const uint64_t edge[B] = { 100, 500, 1000, 2000, 5000, ~0ull };
++            static uint64_t n[B], req[B], got[B], t_last;
++            const uint64_t real = (uint64_t)(t1.tv_sec - t0.tv_sec) * 1000000ull +
++                                  (uint64_t)((t1.tv_nsec - t0.tv_nsec) / 1000);
++            int b = 0; while (usec > edge[b]) b++;
++            n[b]++; req[b] += usec; got[b] += real;
++            const uint64_t now = (uint64_t)t1.tv_sec;
++            if (!t_last) t_last = now;
++            if (now - t_last >= 5) {
++                t_last = now;
++                char line[512]; int len = snprintf(line, sizeof line, "[USLEEP 5s]");
++                for (int k = 0; k < B; k++) if (n[k])
++                    len += snprintf(line + len, sizeof line - len, " <=%lluus: n=%llu req=%lluus got=%lluus",
++                                    (unsigned long long)(edge[k] == ~0ull ? 99999 : edge[k]),
++                                    (unsigned long long)n[k], (unsigned long long)(req[k] / n[k]),
++                                    (unsigned long long)(got[k] / n[k]));
++                snprintf(line + len, sizeof line - len, "\n");
++                fputs(line, stderr);
++                { extern void ps3_perf_udp(const char*); ps3_perf_udp(line); }
++                memset(n, 0, sizeof n); memset(req, 0, sizeof req); memset(got, 0, sizeof got);
++            } } }
+     }
+ #endif
+ 
